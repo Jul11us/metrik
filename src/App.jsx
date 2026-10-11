@@ -5230,8 +5230,9 @@ export function App() {
       timer = undefined;
       if (document.visibilityState === "visible") {
         timer = window.setInterval(() => loadSnapshot(period), refreshEvery);
-      } else if (trayBadgeEnabled) {
-        // 托盘数字还亮在任务栏上：窗口隐藏时保留慢速刷新，数字不会冻在旧值。
+      } else if (trayBadgeEnabled || IS_MAC) {
+        // Windows 托盘数字和 macOS 菜单栏状态项都常亮在系统栏上：窗口隐藏时
+        // 保留慢速刷新，数字不会冻在旧值——macOS 否则会一直 "--" 到用户点开面板。
         timer = window.setInterval(
           () => loadSnapshot(period),
           TRAY_BADGE_HIDDEN_REFRESH_MS,
