@@ -295,6 +295,11 @@ change.
   items can be silently rejected or misassociated. The single item is never
   removed or re-created during a session; only its internal attributed content
   changes.
+- The menu-bar percentages are fed by the compact panel's webview, which is
+  hidden (`orderOut`) most of the time. That window must keep
+  `backgroundThrottling: "disabled"`: WebKit's default inactive policy
+  suspends hidden pages, so the hidden-window refresh timer never fires and the
+  menu bar only updates after the user opens the panel.
 - Clicking any status item opens the anchored compact panel. Agent selection
   updates immediately across the separate settings window, compact panel,
   WidgetKit snapshot, and menu-bar status items, and always keeps at least one
