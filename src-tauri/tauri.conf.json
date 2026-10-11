@@ -28,7 +28,8 @@
         "skipTaskbar": true,
         "preventOverflow": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {
