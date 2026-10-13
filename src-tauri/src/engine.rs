@@ -1214,18 +1214,26 @@ fn capitalize_model(model: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Antigravity 桶名的分组前缀。`3p` 是官方分组 "Claude and GPT models"。
+fn antigravity_group_label(prefix: &str) -> String {
+    match prefix {
+        "3p" => "Claude/GPT".into(),
+        other => capitalize_model(other),
+    }
+}
+
 pub(crate) fn quota_window_label(lang: Lang, adapter_id: &str, key: &str) -> String {
     // Antigravity 的窗口键是官方桶标识（如 gemini_weekly），美化展示。
     if adapter_id == "antigravity" {
         let lower = key.to_ascii_lowercase();
         if let Some(prefix) = lower.strip_suffix("_5h") {
-            let model = capitalize_model(prefix);
+            let model = antigravity_group_label(prefix);
             return format!("{model} · 5h");
         } else if let Some(prefix) = lower.strip_suffix("_weekly") {
-            let model = capitalize_model(prefix);
+            let model = antigravity_group_label(prefix);
             return i18n::tr_in!(lang, "{model} · 每周", "{model} · Weekly");
         } else if let Some(prefix) = lower.strip_suffix("_7d") {
-            let model = capitalize_model(prefix);
+            let model = antigravity_group_label(prefix);
             return format!("{model} · 7d");
         }
         return key.replace('_', " ");
@@ -1569,16 +1577,11 @@ fn source_views(lang: Lang, report: ScanReport, sync_status: Option<SyncView>) -
             "antigravity",
             "antigravity-live",
             i18n::tr_in!(lang, "Antigravity 用量", "Antigravity usage"),
-            scanned(
-                "antigravity",
-                "个活跃会话",
-                "个",
-                ("active session", "active sessions"),
-            ),
+            scanned("antigravity", "个会话", "个", ("session", "sessions")),
             i18n::tr_in!(
                 lang,
-                "用量来自本机 language server 的实时 RPC（IDE 未运行时为 0，不估算）；按 responseId 去重。尚未在装有 Antigravity 的机器上实机验收。",
-                "Usage comes from the live RPC of the local language server (0 while the IDE is not running, never estimated) and is deduplicated by responseId. Not yet verified on a machine with Antigravity installed."
+                "用量来自 ~/.gemini/antigravity/conversations 下的本地会话库（Antigravity 2.x，应用未运行也能读到）；没有本地库的会话（旧版 IDE）在 IDE 运行时经本机 language server 的 RPC 读取。按 responseId 去重，不估算。",
+                "Usage comes from the local conversation databases under ~/.gemini/antigravity/conversations (Antigravity 2.x, readable while the app is closed); sessions without a local database (older IDE builds) are read through the local language server's RPC while the IDE is running. Deduplicated by responseId, never estimated."
             ),
         ),
         official(
@@ -3402,6 +3405,12 @@ mod tests {
         assert_eq!(
             quota_window_label(Lang::Zh, "antigravity", "claude_weekly"),
             "Claude · 每周"
+        );
+        // 2.23 的第三方模型分组（Claude and GPT models）。
+        assert_eq!(quota_window_rank("3p_5h").0, 0);
+        assert_eq!(
+            quota_window_label(Lang::Zh, "antigravity", "3p_5h"),
+            "Claude/GPT · 5h"
         );
     }
 

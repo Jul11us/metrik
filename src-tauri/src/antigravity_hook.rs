@@ -100,8 +100,9 @@ fn payload_from_input(input: &Value, now_ms: i64) -> QuotaFile {
 }
 
 /// 官方桶名是连字符（`gemini-weekly`），引擎与界面的窗口键约定是下划线
-/// （`gemini_weekly`）。统一小写归一，未知后缀原样保留。
-fn normalize_window_key(key: &str) -> String {
+/// （`gemini_weekly`）。统一小写归一，未知后缀原样保留。IDE 的 RPC 配额
+/// 也用同样的桶名，两个来源共用这一处归一。
+pub(crate) fn normalize_window_key(key: &str) -> String {
     key.trim().to_ascii_lowercase().replace('-', "_")
 }
 
