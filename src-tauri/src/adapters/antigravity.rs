@@ -35,7 +35,7 @@
 use super::{AgentAdapter, ParsedScan, ScanDiagnostics, SourceCandidate};
 use crate::domain::{stable_hash, ParsedSource, QuotaSample, TokenVector, UsageEvent};
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -477,6 +477,10 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     for shift in (0..64).step_by(7) {
         let byte = *bytes.get(*pos)?;
         *pos += 1;
+        // 第十个字节只能容纳 u64 的最后一位；否则移位会悄悄截掉溢出位。
+        if shift == 63 && byte > 1 {
+            return None;
+        }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(value);
@@ -493,6 +497,9 @@ impl<'a> ProtoMessage<'a> {
         let mut pos = 0;
         while pos < bytes.len() {
             let key = read_varint(bytes, &mut pos)?;
+            if key >> 3 == 0 || key >> 3 > (1 << 29) - 1 {
+                return None;
+            }
             let value = match key & 7 {
                 0 => Wire::Varint(read_varint(bytes, &mut pos)?),
                 1 | 5 => {
@@ -523,9 +530,19 @@ impl<'a> ProtoMessage<'a> {
         })
     }
 
+    fn all_fields(&self, number: u64) -> impl Iterator<Item = &Wire<'a>> + '_ {
+        self.0
+            .iter()
+            .filter_map(move |(field, value)| (*field == number).then_some(value))
+    }
+
+    fn has_field(&self, number: u64) -> bool {
+        self.all_fields(number).next().is_some()
+    }
+
     fn all_bytes(&self, number: u64) -> impl Iterator<Item = &'a [u8]> + '_ {
-        self.0.iter().filter_map(move |(field, value)| match value {
-            Wire::Bytes(found) if *field == number => Some(*found),
+        self.all_fields(number).filter_map(|value| match value {
+            Wire::Bytes(found) => Some(*found),
             _ => None,
         })
     }
@@ -543,21 +560,21 @@ impl<'a> ProtoMessage<'a> {
     }
 
     /// repeated 标量：proto3 默认 packed，也兼容逐个编码的旧写法。
-    fn repeated_varints(&self, number: u64) -> Vec<u64> {
+    fn repeated_varints(&self, number: u64) -> Option<Vec<u64>> {
         let mut values = Vec::new();
-        for (field, value) in &self.0 {
+        for value in self.all_fields(number) {
             match value {
-                Wire::Varint(found) if *field == number => values.push(*found),
-                Wire::Bytes(packed) if *field == number => {
+                Wire::Varint(found) => values.push(*found),
+                Wire::Bytes(packed) => {
                     let mut pos = 0;
-                    while let Some(found) = read_varint(packed, &mut pos) {
-                        values.push(found);
+                    while pos < packed.len() {
+                        values.push(read_varint(packed, &mut pos)?);
                     }
                 }
-                _ => {}
+                _ => return None,
             }
         }
-        values
+        Some(values)
     }
 }
 
@@ -568,33 +585,50 @@ fn parse_local_database(
     path: &Path,
     cutoff_ms: i64,
 ) -> Result<(String, Vec<UsageEvent>, ScanDiagnostics)> {
+    parse_local_database_with_step_read(path, cutoff_ms, || {})
+}
+
+// after_step_read 让 WAL 并发测试能在两次查询之间确定性地提交写入。
+fn parse_local_database_with_step_read(
+    path: &Path,
+    cutoff_ms: i64,
+    after_step_read: impl FnOnce(),
+) -> Result<(String, Vec<UsageEvent>, ScanDiagnostics)> {
     let cascade_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_owned();
-    let connection = Connection::open_with_flags(
+    let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("failed to open {}", path.display()))?;
     connection.pragma_update(None, "busy_timeout", 2_000_i64)?;
-    let step_times = step_created_ms(&connection)?;
+    // 两张表必须来自同一份快照：否则 WAL 写入可能让新生成找不到它的新 step。
+    // 连接以 READ_ONLY 打开，DEFERRED 事务只固定读快照，不阻塞 WAL 写入者。
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let step_times = step_created_ms(&transaction)?;
+    after_step_read();
 
-    let mut statement = connection.prepare("SELECT data FROM gen_metadata ORDER BY idx")?;
-    let blobs = statement.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
     let mut diagnostics = ScanDiagnostics::default();
     let mut rows = Vec::new();
-    for blob in blobs {
-        let row = blob.ok().flatten().and_then(|data| {
-            generation_json(&data, &step_times, &mut diagnostics.total_mismatches)
-        });
-        // 读不懂的行留空位，保持行号与 RPC 返回的数组下标一致（回退身份要用）。
-        rows.push(row.unwrap_or_else(|| {
-            diagnostics.malformed_lines += 1;
-            Value::Null
-        }));
+    {
+        let mut statement = transaction.prepare("SELECT data FROM gen_metadata ORDER BY idx")?;
+        let blobs = statement.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
+        for blob in blobs {
+            let row = blob
+                .ok()
+                .flatten()
+                .and_then(|data| generation_json(&data, &step_times, &mut diagnostics));
+            // 读不懂的行留空位，保持行号与 RPC 返回的数组下标一致（回退身份要用）。
+            rows.push(row.unwrap_or_else(|| {
+                diagnostics.malformed_lines += 1;
+                Value::Null
+            }));
+        }
     }
+    transaction.commit()?;
     let events = normalize_generator_metadata(
         &json!({ "generatorMetadata": rows }),
         &cascade_id,
@@ -632,29 +666,30 @@ fn step_created_ms(connection: &Connection) -> Result<HashMap<u64, i64>> {
 }
 
 /// 一行 `gen_metadata` → RPC `generatorMetadata[]` 的一个元素。
-/// 读不懂、或带聊天元数据却找不到时间的行返回 None（计入 malformed）；
-/// 不是聊天生成的行返回 `Value::Null`（本就没有用量，不算错）。
+/// 读不懂、或带聊天元数据却找不到时间的行返回 None（调用方计入 malformed）；
+/// 不是聊天生成的行返回 `Value::Null`（本就没有用量，不算错）。损坏的重试
+/// 单独计入 malformed、保留空位，其他可读重试仍然入账。
 fn generation_json(
     data: &[u8],
     step_times: &HashMap<u64, i64>,
-    total_mismatches: &mut usize,
+    diagnostics: &mut ScanDiagnostics,
 ) -> Option<Value> {
     let generation = ProtoMessage::parse(data)?;
     let Some(chat_model) = generation.message(GENERATION_CHAT_MODEL) else {
-        return Some(Value::Null);
+        // 字段缺失才是非聊天生成；存在却解不开时不能当成正常空行。
+        return (!generation.has_field(GENERATION_CHAT_MODEL)).then_some(Value::Null);
     };
     let created_ms = generation
-        .repeated_varints(GENERATION_STEP_INDICES)
+        .repeated_varints(GENERATION_STEP_INDICES)?
         .into_iter()
         .find_map(|index| step_times.get(&index).copied())?;
 
-    let mut usage_json = |usage: &ProtoMessage| {
-        // 自检：output 应恰好是 thinking 与 response 两个子项之和。
-        if let Some(response) = usage.varint(USAGE_RESPONSE_OUTPUT) {
-            let thinking = usage.varint(USAGE_THINKING_OUTPUT).unwrap_or(0);
-            if usage.varint(USAGE_OUTPUT).unwrap_or(0) != thinking.saturating_add(response) {
-                *total_mismatches += 1;
-            }
+    let usage_json = |usage: &ProtoMessage, total_mismatches: &mut usize| {
+        // proto3 会省略零值：纯 thinking 输出和空失败重试也要复核这条等式。
+        let response = usage.varint(USAGE_RESPONSE_OUTPUT).unwrap_or(0);
+        let thinking = usage.varint(USAGE_THINKING_OUTPUT).unwrap_or(0);
+        if thinking.checked_add(response) != Some(usage.varint(USAGE_OUTPUT).unwrap_or(0)) {
+            *total_mismatches += 1;
         }
         let mut fields = serde_json::Map::new();
         for (number, key) in USAGE_COUNTERS {
@@ -677,18 +712,34 @@ fn generation_json(
         row.insert("responseModel".into(), json!(model));
     }
     let retries: Vec<Value> = chat_model
-        .all_bytes(CHAT_MODEL_RETRY_INFOS)
-        .filter_map(ProtoMessage::parse)
-        .map(|retry| {
-            let usage = retry
-                .message(RETRY_INFO_USAGE)
-                .map_or_else(|| json!({}), |usage| usage_json(&usage));
-            json!({ "usage": usage })
+        .all_fields(CHAT_MODEL_RETRY_INFOS)
+        .map(|value| {
+            let retry = match value {
+                Wire::Bytes(data) => ProtoMessage::parse(data),
+                _ => None,
+            };
+            let usage = retry.and_then(|retry| match retry.message(RETRY_INFO_USAGE) {
+                Some(usage) => Some(usage_json(&usage, &mut diagnostics.total_mismatches)),
+                None if !retry.has_field(RETRY_INFO_USAGE) => Some(json!({})),
+                _ => None,
+            });
+            match usage {
+                Some(usage) => json!({ "usage": usage }),
+                None => {
+                    diagnostics.malformed_lines += 1;
+                    Value::Null
+                }
+            }
         })
         .collect();
-    if retries.is_empty() {
+    if !chat_model.has_field(CHAT_MODEL_RETRY_INFOS) {
         if let Some(usage) = chat_model.message(CHAT_MODEL_USAGE) {
-            row.insert("usage".into(), usage_json(&usage));
+            row.insert(
+                "usage".into(),
+                usage_json(&usage, &mut diagnostics.total_mismatches),
+            );
+        } else if chat_model.has_field(CHAT_MODEL_USAGE) {
+            return None;
         }
     } else {
         row.insert("retryInfos".into(), Value::Array(retries));
@@ -1568,6 +1619,178 @@ mod tests {
     }
 
     #[test]
+    fn malformed_nested_messages_keep_valid_retries_at_their_original_positions() {
+        let test = TestDirectory::new("nested-partial");
+        let path = test.0.join("cascade-nested.db");
+        let generation = |chat: &[u8]| [pb_bytes(1, chat), pb_bytes(2, &[1])].concat();
+        let fallback_usage = usage_blob(100, 0, 0, 1, "top-level-must-not-count");
+        let no_id_usage = [pb_varint(2, 5), pb_varint(3, 1), pb_varint(10, 1)].concat();
+        let mixed_retries = [
+            pb_bytes(4, &fallback_usage),
+            // retry 消息自身截断。
+            pb_bytes(17, &[0x12, 0x05, 0x01]),
+            // 没有 usage 的失败重试合法，仍然占据原位置。
+            pb_bytes(17, &[]),
+            pb_bytes(17, &pb_bytes(2, &no_id_usage)),
+            // retry 可读、内嵌 usage 截断，也必须单独标 partial。
+            pb_bytes(17, &pb_bytes(2, &[0x80])),
+        ]
+        .concat();
+        let all_corrupt_retries = [
+            pb_bytes(4, &fallback_usage),
+            pb_bytes(17, &[0x12, 0x05, 0x01]),
+        ]
+        .concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                // chatModel 存在，但内容截断；不是正常的非聊天生成。
+                pb_bytes(1, &[0x0a, 0x05, 0x01]),
+                // 顶层 usage 截断。
+                generation(&pb_bytes(4, &[0x80])),
+                generation(&mixed_retries),
+                generation(&all_corrupt_retries),
+                // 非聊天生成与空 usage 的失败重试不能误报。
+                Vec::new(),
+                generation(&pb_bytes(17, &pb_bytes(2, &[]))),
+            ],
+        );
+
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 5);
+        assert_eq!(diagnostics.total_mismatches, 0);
+        assert!(diagnostics.is_partial());
+        assert_eq!(events.len(), 1);
+        // 前面的损坏行和重试都不能挤掉下标、改变无 responseId 事件的身份。
+        assert_eq!(events[0].event_key, "response:cascade-nested:2:2");
+        assert_eq!(events[0].tokens.processed(), 6);
+    }
+
+    #[test]
+    fn wrong_wire_types_for_nested_messages_are_not_treated_as_absent() {
+        let test = TestDirectory::new("wrong-wire");
+        let path = test.0.join("cascade-wrong-wire.db");
+        let generation = |chat: &[u8]| [pb_bytes(1, chat), pb_bytes(2, &[1])].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                pb_varint(1, 1),
+                generation(&pb_varint(4, 1)),
+                generation(&pb_varint(17, 1)),
+                generation(&pb_bytes(17, &pb_varint(2, 1))),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(diagnostics.malformed_lines, 4);
+        assert!(diagnostics.is_partial());
+    }
+
+    #[test]
+    fn output_split_check_includes_proto3_omitted_zero_components() {
+        let test = TestDirectory::new("omitted-zero");
+        let path = test.0.join("cascade-zero.db");
+        let thinking_only = [pb_varint(3, 5), pb_varint(9, 5), pb_bytes(11, b"thinking")].concat();
+        let response_only = [pb_varint(3, 5), pb_varint(10, 5), pb_bytes(11, b"response")].concat();
+        let wrong_thinking = [
+            pb_varint(3, 99),
+            pb_varint(9, 5),
+            pb_bytes(11, b"wrong-thinking"),
+        ]
+        .concat();
+        let wrong_zero = [pb_varint(3, 5), pb_bytes(11, b"wrong-zero")].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                generation_blob(&[1], "m", &[thinking_only]),
+                generation_blob(&[1], "m", &[response_only]),
+                generation_blob(&[1], "m", &[Vec::new()]),
+                generation_blob(&[1], "m", &[wrong_thinking]),
+                generation_blob(&[1], "m", &[wrong_zero]),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 0);
+        assert_eq!(diagnostics.total_mismatches, 2);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].event_key, "response:thinking");
+        assert_eq!(events[0].tokens.output, 5);
+        assert_eq!(events[0].tokens.reasoning_output, 5);
+        assert_eq!(events[1].event_key, "response:response");
+        assert_eq!(events[1].tokens.reasoning_output, 0);
+    }
+
+    #[test]
+    fn malformed_packed_step_indices_do_not_use_the_valid_prefix() {
+        let test = TestDirectory::new("packed-partial");
+        let path = test.0.join("cascade-packed.db");
+        let usage = usage_blob(1, 0, 0, 1, "truncated-indices");
+        let truncated = [pb_bytes(1, &pb_bytes(4, &usage)), pb_bytes(2, &[1, 0x80])].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                truncated,
+                generation_blob(&[1], "m", &[usage_blob(1, 0, 0, 1, "valid-indices")]),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_key, "response:valid-indices");
+    }
+
+    #[test]
+    fn wal_commit_between_table_reads_is_visible_only_to_the_next_scan() {
+        let test = TestDirectory::new("wal-snapshot");
+        let path = test.0.join("cascade-wal.db");
+        let created = 1_791_239_681;
+        write_conversation(
+            &path,
+            &[(1, step_blob(created, 0))],
+            &[generation_blob(
+                &[1],
+                "m",
+                &[usage_blob(1, 0, 0, 1, "before")],
+            )],
+        );
+        let mut writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::from_secs(2)).unwrap();
+        let (_, initial_events, diagnostics) =
+            parse_local_database_with_step_read(&path, 0, || {
+                let transaction = writer.transaction().unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
+                        [step_blob(created + 1, 0)],
+                    )
+                    .unwrap();
+                let data = generation_blob(&[2], "m", &[usage_blob(2, 0, 0, 1, "after")]);
+                transaction
+                    .execute(
+                        "INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?1, ?2)",
+                        rusqlite::params![&data, data.len() as i64],
+                    )
+                    .unwrap();
+                // WAL 中即使读事务还没结束，也允许另一个连接提交。
+                transaction.commit().unwrap();
+            })
+            .unwrap();
+        assert!(!diagnostics.is_partial(), "{diagnostics:?}");
+        assert_eq!(initial_events.len(), 1);
+        assert_eq!(initial_events[0].event_key, "response:before");
+
+        let (_, next_events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert!(!diagnostics.is_partial(), "{diagnostics:?}");
+        assert_eq!(next_events.len(), 2);
+        assert_eq!(next_events[1].event_key, "response:after");
+        assert_eq!(next_events[1].occurred_at_ms, (created + 1) as i64 * 1000);
+    }
+
+    #[test]
     fn local_rows_before_the_cutoff_are_dropped() {
         let test = TestDirectory::new("cutoff");
         let path = test.0.join("cascade-cutoff.db");
@@ -1637,9 +1860,26 @@ mod tests {
         ]
         .concat();
         let message = ProtoMessage::parse(&bytes).unwrap();
-        assert_eq!(message.repeated_varints(2), [1u64, 150, 7]);
+        assert_eq!(message.repeated_varints(2), Some(vec![1u64, 150, 7]));
         assert_eq!(message.varint(9), Some(3));
         assert_eq!(message.varint(8), None);
+        assert_eq!(
+            ProtoMessage::parse(&pb_bytes(2, &[1, 0x80]))
+                .unwrap()
+                .repeated_varints(2),
+            None
+        );
+    }
+
+    #[test]
+    fn proto_reader_rejects_varint_overflow_and_invalid_field_numbers() {
+        let mut max = vec![0xff; 9];
+        max.push(1);
+        assert_eq!(read_varint(&max, &mut 0), Some(u64::MAX));
+        max[9] = 2;
+        assert_eq!(read_varint(&max, &mut 0), None);
+        assert!(ProtoMessage::parse(&pb_varint(0, 1)).is_none());
+        assert!(ProtoMessage::parse(&pb_varint(1 << 29, 1)).is_none());
     }
 
     #[test]

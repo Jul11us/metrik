@@ -61,6 +61,13 @@ The user-reachable `rebuild_local_ledger(period)` command takes the same scan lo
 - Cursor: one dashboard usage event. The payload has no request id, so identity is timestamp, conversation id, model, and the token components; an identical fingerprint repeated within one day gets an occurrence suffix, so parallel calls in the same millisecond are both counted. Events are deltas and are never merged component-wise.
 - Source paths are observations, not event identity, so moving a session into an archive does not duplicate usage.
 
+Antigravity reads step timestamps and generation metadata in one read-only SQLite
+transaction, so an IDE write between the queries cannot mix two snapshots.
+Malformed nested protobuf messages and packed step indices mark the source as
+partial while readable retries retain their original positions and event
+identities. The output-split self-check treats omitted proto3 components as zero,
+including generations with only thinking output.
+
 ### Replayed history is not new usage
 
 Two sources replay counters that are already ledgered elsewhere. Counting them is the single most expensive class of bug in this system, because the totals stay plausible:
@@ -178,7 +185,7 @@ missing or unreadable ledger is a stderr message with a non-zero exit code.
   the table is wholesale-replaced derived data, so only one stale quota round
   is lost.
 
-SQLite runs in WAL mode under the operating system's local application-data directory. Source replacement and observation updates are transactional. The shared `PARSER_VERSION` is currently 7, with Codex using parser version 8 while request-level pricing metadata is enriched and Pi using 8 so Kimi Code and ChatGPT subscription usage moves to its own cards. Version changes force retained-history reconciliation.
+SQLite runs in WAL mode under the operating system's local application-data directory. Source replacement and observation updates are transactional. The shared `PARSER_VERSION` is currently 7, with Codex using parser version 8 while request-level pricing metadata is enriched, Pi using 8 so Kimi Code and ChatGPT subscription usage moves to its own cards, and Antigravity using 9 to reconcile decoder diagnostics and output-split validation. Version changes force retained-history reconciliation.
 
 `usage_event.project_path` records the working directory an event happened in, so usage can be grouped by project as well as by session. Optional columns like it are added with `ALTER TABLE` and stay out of the required-column check: listing one there would classify every existing ledger as incompatible and rebuild it, when the column simply reads NULL until the next scan. The path is deliberately **not** part of `payload_hash` — it is attribution, not a measured quantity, and hashing it would make the same event hash differently after a parser upgrade, which non-mergeable adapters reject as an identity collision. Backfill is therefore its own write: a rescan fills the column when it is NULL and never overwrites a value already there, because where usage happened is settled fact.
 
