@@ -766,10 +766,16 @@ function sourceStatusCopy(snapshot, loading, partial) {
   };
 }
 
-function Sidebar({ activeNav, onNavChange, snapshot, loading }) {
+function Sidebar({ activeNav, onNavChange, snapshot, loading, nextRefreshAt }) {
   const partial = snapshotIsPartial(snapshot);
   const indexing = (snapshot.indexing?.pending || 0) > 0;
   const sourceStatus = sourceStatusCopy(snapshot, loading, partial);
+  // 下次自动刷新只放进悬停说明：状态行高度固定、不换行，不能塞会变的文字。
+  const statusTitle = nextRefreshAt
+    ? `${sourceStatus.detail}\n${t("下次自动刷新约 {time}", {
+        time: formatClock(new Date(nextRefreshAt).toISOString()),
+      })}`
+    : sourceStatus.detail;
   return (
     <aside className="sidebar" aria-label={t("主导航")}>
       <div className="wordmark">Metrik</div>
@@ -798,7 +804,7 @@ function Sidebar({ activeNav, onNavChange, snapshot, loading }) {
         className="source-status"
         type="button"
         onClick={() => onNavChange("sources")}
-        title={sourceStatus.detail}
+        title={statusTitle}
       >
         <span className={`status-dot ${loading || indexing ? "status-dot--loading" : ""} ${snapshot.loadError ? "status-dot--error" : ""} ${partial && !indexing ? "status-dot--warning" : ""}`} />
         <span>{t("数据统计")}</span>
@@ -5150,6 +5156,8 @@ export function App() {
   // 历史索引还没补齐：账本尚未覆盖完整周期，数字必须显式标注为不完整。
   const indexingPending = snapshot.indexing?.pending || 0;
   const indexing = indexingPending > 0;
+  // 下一次常规自动刷新的时刻，只用于状态提示；补齐索引的快速轮询与窗口隐藏时为空。
+  const [nextRefreshAt, setNextRefreshAt] = useState(null);
   const requestSequence = useRef(0);
   const loadInFlight = useRef(false);
   const activeLoadPeriod = useRef(null);
@@ -5225,11 +5233,19 @@ export function App() {
     const refreshEvery = indexing ? 400 : viewMode === "expanded" ? 60_000 : 300_000;
     let timer;
 
+    // 记的是定时器真正的触发时刻：手动刷新不重置定时器，焦点与可见性变化会。
+    const markNextRefresh = () => setNextRefreshAt(indexing ? null : Date.now() + refreshEvery);
+
     const schedule = () => {
       window.clearInterval(timer);
       timer = undefined;
+      setNextRefreshAt(null);
       if (document.visibilityState === "visible") {
-        timer = window.setInterval(() => loadSnapshot(period), refreshEvery);
+        markNextRefresh();
+        timer = window.setInterval(() => {
+          markNextRefresh();
+          loadSnapshot(period);
+        }, refreshEvery);
       } else if (trayBadgeEnabled || IS_MAC) {
         // Windows 托盘数字和 macOS 菜单栏状态项都常亮在系统栏上：窗口隐藏时
         // 保留慢速刷新，数字不会冻在旧值——macOS 否则会一直 "--" 到用户点开面板。
@@ -5938,7 +5954,13 @@ export function App() {
         >
           <ArrowsClockwise size={15} weight="light" aria-hidden="true" />
         </button>
-        <Sidebar activeNav={activeNav} onNavChange={handleNavChange} snapshot={snapshot} loading={appBusy} />
+        <Sidebar
+          activeNav={activeNav}
+          onNavChange={handleNavChange}
+          snapshot={snapshot}
+          loading={appBusy}
+          nextRefreshAt={nextRefreshAt}
+        />
 
         {activeNav === "overview" ? (
           <>
