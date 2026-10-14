@@ -1,31 +1,50 @@
 //! Google Antigravity（Codeium/Windsurf 血统的 agentic IDE）用量。
 //!
-//! 与其他 adapter 不同：Antigravity 不落本地日志，用量只存在于本机
-//! `language_server` 进程的私有 RPC 后面（`exa.language_server_pb`，自签 TLS，
-//! 认证令牌从进程命令行取）。因此本 adapter 是一个轮询 RPC 客户端，IDE 必须
-//! 正在运行才能读到；进程不在时返回空（显示为 0），绝不估算。
+//! 两个来源，产出同一份 `GeneratorMetadata`、同一套事件键：
 //!
-//! 套进 `AgentAdapter` 框架：`discover` = 列出会话（cascade）+ 一个配额入口，
-//! `parse` = 取该会话的用量记录。账本按 `responseId` 去重——RPC 每次返回该
-//! 会话的**全量**记录，活跃生成会被多次观察到、计数逐步增长，正是账本已有的
+//! 1. **本地会话库**（Antigravity 2.x）：每个会话（cascade）落成
+//!    `~/.gemini/antigravity/conversations/<cascadeId>.db`（SQLite，WAL）。
+//!    `gen_metadata.data` 是 protobuf 编码的 `GeneratorMetadata`，与 RPC
+//!    `GetCascadeTrajectoryGeneratorMetadata` 返回的是同一份数据；时间取自它
+//!    产出的 step（`steps.metadata` 的创建时间）。IDE 没在跑也能读到全部历史。
+//! 2. **language server 私有 RPC**（`exa.language_server_pb`，自签 TLS，认证
+//!    令牌从进程命令行取）：只用于本地没有 `.db` 的会话（旧版 IDE 把会话存成
+//!    `.pb`，不是这种库）。IDE 必须正在运行；进程不在时返回空，绝不估算。
+//!    2.23 实测：端点发现与配额 RPC 正常，但 `GetAllCascadeTrajectories` 返回
+//!    空对象，`chatStartMetadata` 也不再带 `createdAt`（只剩 `checkpointIndex`
+//!    与 `contextWindowMetadata`）——单靠 RPC，2.x 的用量一条都读不到。对本地
+//!    20 个会话逐个调 `GetCascadeTrajectoryGeneratorMetadata`，与本地库解析出的
+//!    1383 个事件 event_id、token 分量、模型名全部一致。
+//!
+//! 套进 `AgentAdapter` 框架：`discover` = 本地库 + RPC 会话 + 一个配额入口，
+//! `parse` = 取该会话的用量记录。账本按 `responseId` 去重——每次都读到该会话的
+//! **全量**记录，活跃生成会被多次观察到、计数逐步增长，正是账本已有的
 //! 「按 provider id 合并、分量取最大值」语义（与 Claude 同型，见 storage.rs）。
 //!
-//! 口径注记（未在真机验证，上线前须核对）：
-//! - `cacheReadTokens` 有；cache write 无证据存在，恒记 0 并如实标注。
-//! - `thinkingOutputTokens` 作为 output 的子项（reasoning_output），不重复计入
-//!   processed。参考实现 tokscale 假设 output 不含 thinking 而分开相加；本项目
-//!   口径相反。若真机总量对不上，改这里而不是账单口径。
-//! - 模型名占位符（`model_placeholder_m37` 等）查表转真名，查不到原样保留。
+//! 口径注记（2026-10 用本机 Antigravity 2.23 的 20 个会话、1383 次生成核对）：
+//! - `inputTokens` 不含缓存：上下文增长时 input 回落、`cacheReadTokens` 接上。
+//! - cache write 字段在全部样本里都没出现过（只用过 Gemini），恒记 0。
+//! - `outputTokens == thinkingOutputTokens + responseOutputTokens` 在全部样本里
+//!   成立，所以 thinking 是 output 的子项（reasoning_output），不重复计入
+//!   processed。参考实现 tokscale 把两者分开相加，是错的。本地库每次读取都复核
+//!   这条等式，对不上就把来源标成数据不完整。
+//! - `responseId` 全部存在且跨会话唯一。
+//! - 模型名优先用 `responseModel`（真名）；占位符（`model_placeholder_m37` 等）
+//!   查表转真名，查不到原样保留。
 
 use super::{AgentAdapter, ParsedScan, ScanDiagnostics, SourceCandidate};
 use crate::domain::{stable_hash, ParsedSource, QuotaSample, TokenVector, UsageEvent};
 use anyhow::{anyhow, Context, Result};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const RPC_BASE_METHOD: &str = "/exa.language_server_pb.LanguageServerService";
+/// RPC 会话的定位符前缀；本地库的定位符是真实文件路径。
+const RPC_LOCATOR_PREFIX: &str = "antigravity://cascade/";
 
 #[derive(Clone)]
 struct Endpoint {
@@ -81,11 +100,42 @@ pub fn fetch_antigravity_quota_snapshot(timeout: Duration) -> Result<Vec<QuotaSa
     Ok(parse_quota_summary(&value))
 }
 
-pub struct AntigravityAdapter;
+pub struct AntigravityAdapter {
+    /// 本地会话库所在目录：2.x 应用写 `~/.gemini/antigravity`；单独安装的 IDE
+    /// 的数据目录是 `~/.gemini/antigravity-ide`（2.x 应用迁移会话时的目标）。
+    /// 后者的库格式还没在真机上见过，表结构对不上时该源报错、标数据不完整。
+    conversation_dirs: Vec<PathBuf>,
+}
 
 impl AntigravityAdapter {
     pub fn detected() -> Self {
-        Self
+        let gemini = dirs::home_dir().unwrap_or_default().join(".gemini");
+        Self {
+            conversation_dirs: ["antigravity", "antigravity-ide"]
+                .iter()
+                .map(|app| gemini.join(app).join("conversations"))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_conversation_dirs(conversation_dirs: Vec<PathBuf>) -> Self {
+        Self { conversation_dirs }
+    }
+
+    /// 全部本地会话库，不看 cutoff：RPC 那边要靠它判断哪些会话已有本地来源。
+    /// `-wal`/`-shm` 旁路文件的扩展名不是 `db`，不会混进来。
+    fn local_databases(&self) -> Vec<PathBuf> {
+        let mut databases: Vec<PathBuf> = self
+            .conversation_dirs
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("db"))
+            .collect();
+        databases.sort();
+        databases
     }
 }
 
@@ -94,43 +144,45 @@ impl AgentAdapter for AntigravityAdapter {
         "antigravity"
     }
 
-    fn discover(&self, _cutoff_ms: i64) -> Vec<SourceCandidate> {
+    fn discover(&self, cutoff_ms: i64) -> Vec<SourceCandidate> {
+        let databases = self.local_databases();
+        let mut candidates: Vec<SourceCandidate> = databases
+            .iter()
+            .flat_map(|database| super::sqlite_candidate(database, self.id(), cutoff_ms))
+            .collect();
+
         let Some(endpoint) = get_endpoint() else {
-            return Vec::new();
+            return candidates;
         };
-        let mut candidates = Vec::new();
+        let local_ids: HashSet<&str> = databases
+            .iter()
+            .filter_map(|database| database.file_stem()?.to_str())
+            .collect();
         if let Ok(list) = rpc_call(&endpoint, "GetAllCascadeTrajectories", &json!({})) {
-            for cascade in normalize_trajectory_summaries(&list) {
-                candidates.push(SourceCandidate {
-                    source_id: stable_hash(&format!("antigravity|{}", cascade.id)),
-                    path: PathBuf::from(format!("antigravity://cascade/{}", cascade.id)),
-                    // stepCount 变化即内容变化，用它当"文件大小"触发重扫。
-                    size: cascade.step_count.max(0) as u64,
-                    mtime_ns: cascade.last_modified_ms.saturating_mul(1_000_000),
-                });
-            }
+            candidates.extend(rpc_candidates(&list, &local_ids));
         }
         candidates
     }
 
     fn parse(&self, candidate: &SourceCandidate, cutoff_ms: i64) -> Result<ParsedScan> {
-        let endpoint =
-            get_endpoint().ok_or_else(|| anyhow!("Antigravity language server 未在运行"))?;
-
-        // cascade 路径形如 antigravity://cascade/<id>
-        let cascade_id = candidate
+        let (cascade_id, events, diagnostics) = match candidate
             .path
             .to_string_lossy()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        let metadata = rpc_call(
-            &endpoint,
-            "GetCascadeTrajectoryGeneratorMetadata",
-            &json!({ "cascadeId": cascade_id }),
-        )?;
-        let events = normalize_generator_metadata(&metadata, &cascade_id, cutoff_ms);
+            .strip_prefix(RPC_LOCATOR_PREFIX)
+        {
+            Some(cascade_id) => {
+                let endpoint = get_endpoint()
+                    .ok_or_else(|| anyhow!("Antigravity language server 未在运行"))?;
+                let metadata = rpc_call(
+                    &endpoint,
+                    "GetCascadeTrajectoryGeneratorMetadata",
+                    &json!({ "cascadeId": cascade_id }),
+                )?;
+                let events = normalize_generator_metadata(&metadata, cascade_id, cutoff_ms);
+                (cascade_id.to_owned(), events, ScanDiagnostics::default())
+            }
+            None => parse_local_database(&candidate.path, cutoff_ms)?,
+        };
 
         Ok(ParsedScan {
             source: ParsedSource {
@@ -143,7 +195,7 @@ impl AgentAdapter for AntigravityAdapter {
                 events,
                 quotas: Vec::new(),
             },
-            diagnostics: ScanDiagnostics::default(),
+            diagnostics,
         })
     }
 }
@@ -154,6 +206,21 @@ struct CascadeRef {
     id: String,
     last_modified_ms: i64,
     step_count: i64,
+}
+
+/// RPC 会话列表 → 候选。已有本地库的会话跳过：同一份数据不必经 RPC 再读一遍。
+fn rpc_candidates(list: &Value, local_ids: &HashSet<&str>) -> Vec<SourceCandidate> {
+    normalize_trajectory_summaries(list)
+        .into_iter()
+        .filter(|cascade| !local_ids.contains(cascade.id.as_str()))
+        .map(|cascade| SourceCandidate {
+            source_id: stable_hash(&format!("antigravity|{}", cascade.id)),
+            path: PathBuf::from(format!("{RPC_LOCATOR_PREFIX}{}", cascade.id)),
+            // stepCount 变化即内容变化，用它当"文件大小"触发重扫。
+            size: cascade.step_count.max(0) as u64,
+            mtime_ns: cascade.last_modified_ms.saturating_mul(1_000_000),
+        })
+        .collect()
 }
 
 /// `trajectorySummaries` 可能是数组，也可能是以 cascadeId 为键的对象；
@@ -257,6 +324,8 @@ fn normalize_generator_metadata(
 
 /// 官方配额：两个 group（Gemini / Claude+GPT），各含 weekly + 5h 桶。
 /// `remainingFraction` 可能直接给，也可能包在 oneof `remaining.remainingFraction`。
+/// 桶名是连字符（2.23 实测 `gemini-weekly`、`3p-5h`），按 statusLine 钩子的
+/// 约定归一成下划线，否则界面认不出窗口、标签不会美化。
 fn parse_quota_summary(value: &Value) -> Vec<QuotaSample> {
     let root = value
         .get("response")
@@ -292,7 +361,7 @@ fn parse_quota_summary(value: &Value) -> Vec<QuotaSample> {
             };
             samples.push(QuotaSample {
                 adapter_id: "antigravity",
-                window_key: bucket_id,
+                window_key: crate::antigravity_hook::normalize_window_key(&bucket_id),
                 remaining_percent: (remaining * 100.0).clamp(0.0, 100.0),
                 resets_at_ms: first_time_ms(bucket, &["resetTime", "resetsAt"]),
                 collected_at_ms: now,
@@ -363,6 +432,319 @@ fn first_time_ms(value: &Value, keys: &[&str]) -> Option<i64> {
         }
     }
     None
+}
+
+// ── 本地会话库（Antigravity 2.x：protobuf 存在 SQLite 里） ─────────
+//
+// 字段号是从真实会话库里对出来的（值与 RPC JSON 一一对应），只列用到的：
+//   GeneratorMetadata  1 chatModel  2 产出的 step 下标（packed）
+//   ChatModelMetadata  4 usage  17 retryInfos[]（2 usage）  19 responseModel
+//   ModelUsageStats    2 inputTokens  3 outputTokens  5 cacheReadTokens
+//                      9 thinkingOutputTokens  10 responseOutputTokens  11 responseId
+//   CortexStepMetadata 1 createdAt（Timestamp：1 秒  2 纳秒）
+
+const GENERATION_CHAT_MODEL: u64 = 1;
+const GENERATION_STEP_INDICES: u64 = 2;
+const CHAT_MODEL_USAGE: u64 = 4;
+const CHAT_MODEL_RETRY_INFOS: u64 = 17;
+const CHAT_MODEL_RESPONSE_MODEL: u64 = 19;
+const RETRY_INFO_USAGE: u64 = 2;
+const USAGE_OUTPUT: u64 = 3;
+const USAGE_THINKING_OUTPUT: u64 = 9;
+const USAGE_RESPONSE_OUTPUT: u64 = 10;
+const USAGE_RESPONSE_ID: u64 = 11;
+const USAGE_COUNTERS: [(u64, &str); 5] = [
+    (2, "inputTokens"),
+    (USAGE_OUTPUT, "outputTokens"),
+    (5, "cacheReadTokens"),
+    (USAGE_THINKING_OUTPUT, "thinkingOutputTokens"),
+    (USAGE_RESPONSE_OUTPUT, "responseOutputTokens"),
+];
+const STEP_CREATED_AT: u64 = 1;
+
+/// protobuf 线格式的一个字段值。定长字段用不到，只跳过。
+enum Wire<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    Fixed,
+}
+
+/// 一条 protobuf 消息拆成的 (字段号, 值) 列表。没有 .proto 也能按字段号取值。
+struct ProtoMessage<'a>(Vec<(u64, Wire<'a>)>);
+
+fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        // 第十个字节只能容纳 u64 的最后一位；否则移位会悄悄截掉溢出位。
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+impl<'a> ProtoMessage<'a> {
+    /// 任何越界或未知线型都返回 None：宁可整条记为读不懂，也不从错位的字节里
+    /// 读出一个看似合理的数。
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        let mut fields = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let key = read_varint(bytes, &mut pos)?;
+            if key >> 3 == 0 || key >> 3 > (1 << 29) - 1 {
+                return None;
+            }
+            let value = match key & 7 {
+                0 => Wire::Varint(read_varint(bytes, &mut pos)?),
+                1 | 5 => {
+                    pos = pos.checked_add(if key & 7 == 1 { 8 } else { 4 })?;
+                    Wire::Fixed
+                }
+                2 => {
+                    let len = usize::try_from(read_varint(bytes, &mut pos)?).ok()?;
+                    let end = pos.checked_add(len)?;
+                    let payload = bytes.get(pos..end)?;
+                    pos = end;
+                    Wire::Bytes(payload)
+                }
+                _ => return None,
+            };
+            if pos > bytes.len() {
+                return None;
+            }
+            fields.push((key >> 3, value));
+        }
+        Some(Self(fields))
+    }
+
+    fn varint(&self, number: u64) -> Option<u64> {
+        self.0.iter().find_map(|(field, value)| match value {
+            Wire::Varint(found) if *field == number => Some(*found),
+            _ => None,
+        })
+    }
+
+    fn all_fields(&self, number: u64) -> impl Iterator<Item = &Wire<'a>> + '_ {
+        self.0
+            .iter()
+            .filter_map(move |(field, value)| (*field == number).then_some(value))
+    }
+
+    fn has_field(&self, number: u64) -> bool {
+        self.all_fields(number).next().is_some()
+    }
+
+    fn all_bytes(&self, number: u64) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.all_fields(number).filter_map(|value| match value {
+            Wire::Bytes(found) => Some(*found),
+            _ => None,
+        })
+    }
+
+    fn message(&self, number: u64) -> Option<ProtoMessage<'a>> {
+        self.all_bytes(number).next().and_then(ProtoMessage::parse)
+    }
+
+    fn string(&self, number: u64) -> Option<String> {
+        let bytes = self.all_bytes(number).next()?;
+        std::str::from_utf8(bytes)
+            .ok()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// repeated 标量：proto3 默认 packed，也兼容逐个编码的旧写法。
+    fn repeated_varints(&self, number: u64) -> Option<Vec<u64>> {
+        let mut values = Vec::new();
+        for value in self.all_fields(number) {
+            match value {
+                Wire::Varint(found) => values.push(*found),
+                Wire::Bytes(packed) => {
+                    let mut pos = 0;
+                    while pos < packed.len() {
+                        values.push(read_varint(packed, &mut pos)?);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(values)
+    }
+}
+
+/// 读一个本地会话库：每行 `gen_metadata` 转成 RPC 的 JSON 形状，再交给
+/// `normalize_generator_metadata`——两个来源共用一套口径与事件键，同一次生成
+/// 不论从哪边读到都落成同一个事件。
+fn parse_local_database(
+    path: &Path,
+    cutoff_ms: i64,
+) -> Result<(String, Vec<UsageEvent>, ScanDiagnostics)> {
+    parse_local_database_with_step_read(path, cutoff_ms, || {})
+}
+
+// after_step_read 让 WAL 并发测试能在两次查询之间确定性地提交写入。
+fn parse_local_database_with_step_read(
+    path: &Path,
+    cutoff_ms: i64,
+    after_step_read: impl FnOnce(),
+) -> Result<(String, Vec<UsageEvent>, ScanDiagnostics)> {
+    let cascade_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", path.display()))?;
+    connection.pragma_update(None, "busy_timeout", 2_000_i64)?;
+    // 两张表必须来自同一份快照：否则 WAL 写入可能让新生成找不到它的新 step。
+    // 连接以 READ_ONLY 打开，DEFERRED 事务只固定读快照，不阻塞 WAL 写入者。
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let step_times = step_created_ms(&transaction)?;
+    after_step_read();
+
+    let mut diagnostics = ScanDiagnostics::default();
+    let mut rows = Vec::new();
+    {
+        let mut statement = transaction.prepare("SELECT data FROM gen_metadata ORDER BY idx")?;
+        let blobs = statement.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
+        for blob in blobs {
+            let row = blob
+                .ok()
+                .flatten()
+                .and_then(|data| generation_json(&data, &step_times, &mut diagnostics));
+            // 读不懂的行留空位，保持行号与 RPC 返回的数组下标一致（回退身份要用）。
+            rows.push(row.unwrap_or_else(|| {
+                diagnostics.malformed_lines += 1;
+                Value::Null
+            }));
+        }
+    }
+    transaction.commit()?;
+    let events = normalize_generator_metadata(
+        &json!({ "generatorMetadata": rows }),
+        &cascade_id,
+        cutoff_ms,
+    );
+    Ok((cascade_id, events, diagnostics))
+}
+
+/// step 下标 → 创建时间（毫秒）。生成本身不带时间，归日只能借它产出的 step。
+fn step_created_ms(connection: &Connection) -> Result<HashMap<u64, i64>> {
+    let mut statement =
+        connection.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut times = HashMap::new();
+    for (index, metadata) in rows.filter_map(Result::ok) {
+        let Some(created) =
+            ProtoMessage::parse(&metadata).and_then(|step| step.message(STEP_CREATED_AT))
+        else {
+            continue;
+        };
+        let (Ok(index), Some(seconds)) = (u64::try_from(index), created.varint(1)) else {
+            continue;
+        };
+        let Ok(seconds) = i64::try_from(seconds) else {
+            continue;
+        };
+        let millis = i64::try_from(created.varint(2).unwrap_or(0) / 1_000_000).unwrap_or(0);
+        if seconds > 0 {
+            times.insert(index, seconds.saturating_mul(1000).saturating_add(millis));
+        }
+    }
+    Ok(times)
+}
+
+/// 一行 `gen_metadata` → RPC `generatorMetadata[]` 的一个元素。
+/// 读不懂、或带聊天元数据却找不到时间的行返回 None（调用方计入 malformed）；
+/// 不是聊天生成的行返回 `Value::Null`（本就没有用量，不算错）。损坏的重试
+/// 单独计入 malformed、保留空位，其他可读重试仍然入账。
+fn generation_json(
+    data: &[u8],
+    step_times: &HashMap<u64, i64>,
+    diagnostics: &mut ScanDiagnostics,
+) -> Option<Value> {
+    let generation = ProtoMessage::parse(data)?;
+    let Some(chat_model) = generation.message(GENERATION_CHAT_MODEL) else {
+        // 字段缺失才是非聊天生成；存在却解不开时不能当成正常空行。
+        return (!generation.has_field(GENERATION_CHAT_MODEL)).then_some(Value::Null);
+    };
+    let created_ms = generation
+        .repeated_varints(GENERATION_STEP_INDICES)?
+        .into_iter()
+        .find_map(|index| step_times.get(&index).copied())?;
+
+    let usage_json = |usage: &ProtoMessage, total_mismatches: &mut usize| {
+        // proto3 会省略零值：纯 thinking 输出和空失败重试也要复核这条等式。
+        let response = usage.varint(USAGE_RESPONSE_OUTPUT).unwrap_or(0);
+        let thinking = usage.varint(USAGE_THINKING_OUTPUT).unwrap_or(0);
+        if thinking.checked_add(response) != Some(usage.varint(USAGE_OUTPUT).unwrap_or(0)) {
+            *total_mismatches += 1;
+        }
+        let mut fields = serde_json::Map::new();
+        for (number, key) in USAGE_COUNTERS {
+            if let Some(value) = usage.varint(number) {
+                fields.insert(key.into(), json!(value));
+            }
+        }
+        if let Some(response_id) = usage.string(USAGE_RESPONSE_ID) {
+            fields.insert("responseId".into(), json!(response_id));
+        }
+        Value::Object(fields)
+    };
+
+    let mut row = serde_json::Map::new();
+    row.insert(
+        "chatStartMetadata".into(),
+        json!({ "createdAt": created_ms }),
+    );
+    if let Some(model) = chat_model.string(CHAT_MODEL_RESPONSE_MODEL) {
+        row.insert("responseModel".into(), json!(model));
+    }
+    let retries: Vec<Value> = chat_model
+        .all_fields(CHAT_MODEL_RETRY_INFOS)
+        .map(|value| {
+            let retry = match value {
+                Wire::Bytes(data) => ProtoMessage::parse(data),
+                _ => None,
+            };
+            let usage = retry.and_then(|retry| match retry.message(RETRY_INFO_USAGE) {
+                Some(usage) => Some(usage_json(&usage, &mut diagnostics.total_mismatches)),
+                None if !retry.has_field(RETRY_INFO_USAGE) => Some(json!({})),
+                _ => None,
+            });
+            match usage {
+                Some(usage) => json!({ "usage": usage }),
+                None => {
+                    diagnostics.malformed_lines += 1;
+                    Value::Null
+                }
+            }
+        })
+        .collect();
+    if !chat_model.has_field(CHAT_MODEL_RETRY_INFOS) {
+        if let Some(usage) = chat_model.message(CHAT_MODEL_USAGE) {
+            row.insert(
+                "usage".into(),
+                usage_json(&usage, &mut diagnostics.total_mismatches),
+            );
+        } else if chat_model.has_field(CHAT_MODEL_USAGE) {
+            return None;
+        }
+    } else {
+        row.insert("retryInfos".into(), Value::Array(retries));
+    }
+    Some(json!({ "chatModel": row }))
 }
 
 // ── I/O 层（TLS、进程/端口发现、RPC） ──────────────────────────
@@ -952,6 +1334,27 @@ mod tests {
         assert!((samples[1].remaining_percent - 75.0).abs() < 1e-9);
     }
 
+    /// Antigravity 2.23 的 RetrieveUserQuotaSummary 真机响应形状：外层包一层
+    /// `response`，桶名是连字符，要归一成与 statusLine 钩子相同的窗口键。
+    #[test]
+    fn quota_summary_normalizes_hyphenated_bucket_ids() {
+        let value = json!({ "response": { "groups": [
+            { "displayName": "Gemini Models", "buckets": [
+                { "bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining",
+                  "window": "weekly", "remainingFraction": 1, "resetTime": "2026-10-20T00:00:00Z" },
+                { "bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.5 }
+            ]},
+            { "displayName": "Claude and GPT models", "buckets": [
+                { "bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.25 }
+            ]}
+        ]}});
+        let keys: Vec<String> = parse_quota_summary(&value)
+            .into_iter()
+            .map(|sample| sample.window_key)
+            .collect();
+        assert_eq!(keys, ["gemini_weekly", "gemini_5h", "3p_5h"]);
+    }
+
     #[test]
     fn trajectory_summaries_accept_array_and_object_forms() {
         let as_array = json!({ "trajectorySummaries": [
@@ -963,6 +1366,520 @@ mod tests {
         assert_eq!(normalize_trajectory_summaries(&as_array).len(), 1);
         assert_eq!(normalize_trajectory_summaries(&as_object).len(), 1);
         assert_eq!(normalize_trajectory_summaries(&as_array)[0].id, "a");
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "metrik-antigravity-{label}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pb_varint_value(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn pb_varint(number: u64, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        pb_varint_value(number << 3, &mut out);
+        pb_varint_value(value, &mut out);
+        out
+    }
+
+    fn pb_bytes(number: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        pb_varint_value((number << 3) | 2, &mut out);
+        pb_varint_value(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 真实库里的 ModelUsageStats 形状：1 模型枚举、7 messageId、8 响应头都在，
+    /// 解析时必须被安全跳过。
+    fn usage_blob(input: u64, cache_read: u64, thinking: u64, response: u64, id: &str) -> Vec<u8> {
+        let mut usage = [
+            pb_varint(1, 1318),
+            pb_varint(2, input),
+            pb_varint(3, thinking + response),
+        ]
+        .concat();
+        if cache_read > 0 {
+            usage.extend(pb_varint(5, cache_read));
+        }
+        usage.extend(pb_varint(6, 24));
+        usage.extend(pb_bytes(7, b"bot-0000"));
+        usage.extend(pb_bytes(
+            8,
+            &[pb_bytes(1, b"sessionID"), pb_bytes(2, b"-1")].concat(),
+        ));
+        usage.extend(pb_varint(9, thinking));
+        usage.extend(pb_varint(10, response));
+        usage.extend(pb_bytes(11, id.as_bytes()));
+        usage
+    }
+
+    /// 失败的重试：usage 只带零值字段（proto3 不写零），这里给个空消息。
+    fn generation_blob(steps: &[u64], model: &str, retries: &[Vec<u8>]) -> Vec<u8> {
+        let mut chat_model = pb_varint(3, 1318);
+        if let Some(last) = retries.last() {
+            chat_model.extend(pb_bytes(4, last));
+        }
+        for usage in retries {
+            chat_model.extend(pb_bytes(17, &pb_bytes(2, usage)));
+        }
+        chat_model.extend(pb_bytes(19, model.as_bytes()));
+        let mut packed = Vec::new();
+        for step in steps {
+            pb_varint_value(*step, &mut packed);
+        }
+        [
+            pb_bytes(1, &chat_model),
+            pb_bytes(2, &packed),
+            pb_bytes(4, b"00000000-0000-0000-0000-000000000000"),
+        ]
+        .concat()
+    }
+
+    fn step_blob(seconds: u64, nanos: u64) -> Vec<u8> {
+        [
+            pb_bytes(1, &[pb_varint(1, seconds), pb_varint(2, nanos)].concat()),
+            pb_varint(3, 2),
+        ]
+        .concat()
+    }
+
+    /// 只建用得到的表与列，形状取自 Antigravity 2.23 的会话库。
+    fn write_conversation(path: &Path, steps: &[(i64, Vec<u8>)], generations: &[Vec<u8>]) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE steps (idx integer, step_type integer NOT NULL DEFAULT 0,
+                     metadata blob, PRIMARY KEY (idx));
+                 CREATE TABLE gen_metadata (idx integer, data blob,
+                     size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx));",
+            )
+            .unwrap();
+        for (index, metadata) in steps {
+            connection
+                .execute(
+                    "INSERT INTO steps (idx, step_type, metadata) VALUES (?1, 15, ?2)",
+                    rusqlite::params![index, metadata],
+                )
+                .unwrap();
+        }
+        for (index, data) in generations.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![index as i64, data, data.len() as i64],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn local_database_reads_usage_with_the_step_timestamp() {
+        let test = TestDirectory::new("local");
+        let path = test.0.join("cascade-local.db");
+        let created = 1_791_239_681u64;
+        write_conversation(
+            &path,
+            &[
+                (1, step_blob(created, 795_389_800)),
+                (3, step_blob(created + 6, 0)),
+            ],
+            &[
+                generation_blob(
+                    &[1, 2],
+                    "gemini-3.8-flash",
+                    &[usage_blob(13_470, 0, 265, 74, "resp-a")],
+                ),
+                // 两次失败重试（零用量）后成功：只记成功那次。
+                generation_blob(
+                    &[3, 4],
+                    "gemini-3.8-flash",
+                    &[
+                        Vec::new(),
+                        Vec::new(),
+                        usage_blob(6_336, 24_437, 50, 81, "resp-b"),
+                    ],
+                ),
+            ],
+        );
+        let adapter = AntigravityAdapter::with_conversation_dirs(vec![test.0.clone()]);
+        let candidates = crate::adapters::sqlite_candidate(&path, "antigravity", 0);
+        let scan = adapter.parse(&candidates[0], 0).unwrap();
+
+        assert!(!scan.diagnostics.is_partial(), "{:?}", scan.diagnostics);
+        assert_eq!(scan.source.logical_key, "cascade-local");
+        let events = &scan.source.events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_key, "response:resp-a");
+        assert_eq!(events[0].session_id, "cascade-local");
+        assert_eq!(events[0].model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(events[0].occurred_at_ms, created as i64 * 1000 + 795);
+        assert_eq!(events[0].tokens.input_uncached, 13_470);
+        assert_eq!(events[0].tokens.output, 339);
+        assert_eq!(events[0].tokens.reasoning_output, 265);
+        assert_eq!(events[0].tokens.processed(), 13_470 + 339);
+        assert_eq!(events[1].event_key, "response:resp-b");
+        assert_eq!(events[1].occurred_at_ms, (created as i64 + 6) * 1000);
+        assert_eq!(events[1].tokens.cache_read, 24_437);
+        assert_eq!(events[1].tokens.processed(), 6_336 + 24_437 + 131);
+    }
+
+    /// 同一次生成从本地库和 RPC 读到，必须落成同一个事件（同 event_id、同分量），
+    /// 账本才会合并而不是重复计数。
+    #[test]
+    fn local_and_rpc_observations_of_a_generation_are_the_same_event() {
+        let test = TestDirectory::new("parity");
+        let path = test.0.join("cascade-parity.db");
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[generation_blob(
+                &[1],
+                "gemini-3.8-flash",
+                &[usage_blob(100, 900, 12, 28, "resp-same")],
+            )],
+        );
+        let (_, local, _) = parse_local_database(&path, 0).unwrap();
+        let rpc = normalize_generator_metadata(
+            &json!({ "generatorMetadata": [{ "chatModel": {
+                "responseModel": "gemini-3.8-flash",
+                "chatStartMetadata": { "createdAt": "2026-10-05T22:34:41Z" },
+                "retryInfos": [{ "usage": {
+                    "inputTokens": "100", "outputTokens": "40", "cacheReadTokens": "900",
+                    "thinkingOutputTokens": "12", "responseOutputTokens": "28",
+                    "responseId": "resp-same"
+                }}]
+            }}]}),
+            "cascade-parity",
+            0,
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(rpc.len(), 1);
+        assert_eq!(local[0].event_id, rpc[0].event_id);
+        assert_eq!(local[0].payload_hash, rpc[0].payload_hash);
+    }
+
+    #[test]
+    fn unreadable_rows_and_output_split_mismatches_mark_the_source_partial() {
+        let test = TestDirectory::new("partial");
+        let path = test.0.join("cascade-partial.db");
+        // output 99 与 thinking 5 + response 5 对不上。
+        let contradictory = [
+            pb_varint(2, 10),
+            pb_varint(3, 99),
+            pb_varint(9, 5),
+            pb_varint(10, 5),
+            pb_bytes(11, b"resp-bad"),
+        ]
+        .concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                // 截断的字节：不能读出一个看似合理的数。
+                vec![0x0a, 0x10, 0x01],
+                // 找不到产出 step 的时间：无法归日。
+                generation_blob(&[7], "gemini-3.8-flash", &[usage_blob(1, 0, 1, 1, "x")]),
+                generation_blob(&[1], "gemini-3.8-flash", &[contradictory]),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 2);
+        assert_eq!(diagnostics.total_mismatches, 1);
+        assert!(diagnostics.is_partial());
+        // 能读的那行仍然入账。
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_key, "response:resp-bad");
+    }
+
+    #[test]
+    fn malformed_nested_messages_keep_valid_retries_at_their_original_positions() {
+        let test = TestDirectory::new("nested-partial");
+        let path = test.0.join("cascade-nested.db");
+        let generation = |chat: &[u8]| [pb_bytes(1, chat), pb_bytes(2, &[1])].concat();
+        let fallback_usage = usage_blob(100, 0, 0, 1, "top-level-must-not-count");
+        let no_id_usage = [pb_varint(2, 5), pb_varint(3, 1), pb_varint(10, 1)].concat();
+        let mixed_retries = [
+            pb_bytes(4, &fallback_usage),
+            // retry 消息自身截断。
+            pb_bytes(17, &[0x12, 0x05, 0x01]),
+            // 没有 usage 的失败重试合法，仍然占据原位置。
+            pb_bytes(17, &[]),
+            pb_bytes(17, &pb_bytes(2, &no_id_usage)),
+            // retry 可读、内嵌 usage 截断，也必须单独标 partial。
+            pb_bytes(17, &pb_bytes(2, &[0x80])),
+        ]
+        .concat();
+        let all_corrupt_retries = [
+            pb_bytes(4, &fallback_usage),
+            pb_bytes(17, &[0x12, 0x05, 0x01]),
+        ]
+        .concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                // chatModel 存在，但内容截断；不是正常的非聊天生成。
+                pb_bytes(1, &[0x0a, 0x05, 0x01]),
+                // 顶层 usage 截断。
+                generation(&pb_bytes(4, &[0x80])),
+                generation(&mixed_retries),
+                generation(&all_corrupt_retries),
+                // 非聊天生成与空 usage 的失败重试不能误报。
+                Vec::new(),
+                generation(&pb_bytes(17, &pb_bytes(2, &[]))),
+            ],
+        );
+
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 5);
+        assert_eq!(diagnostics.total_mismatches, 0);
+        assert!(diagnostics.is_partial());
+        assert_eq!(events.len(), 1);
+        // 前面的损坏行和重试都不能挤掉下标、改变无 responseId 事件的身份。
+        assert_eq!(events[0].event_key, "response:cascade-nested:2:2");
+        assert_eq!(events[0].tokens.processed(), 6);
+    }
+
+    #[test]
+    fn wrong_wire_types_for_nested_messages_are_not_treated_as_absent() {
+        let test = TestDirectory::new("wrong-wire");
+        let path = test.0.join("cascade-wrong-wire.db");
+        let generation = |chat: &[u8]| [pb_bytes(1, chat), pb_bytes(2, &[1])].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                pb_varint(1, 1),
+                generation(&pb_varint(4, 1)),
+                generation(&pb_varint(17, 1)),
+                generation(&pb_bytes(17, &pb_varint(2, 1))),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(diagnostics.malformed_lines, 4);
+        assert!(diagnostics.is_partial());
+    }
+
+    #[test]
+    fn output_split_check_includes_proto3_omitted_zero_components() {
+        let test = TestDirectory::new("omitted-zero");
+        let path = test.0.join("cascade-zero.db");
+        let thinking_only = [pb_varint(3, 5), pb_varint(9, 5), pb_bytes(11, b"thinking")].concat();
+        let response_only = [pb_varint(3, 5), pb_varint(10, 5), pb_bytes(11, b"response")].concat();
+        let wrong_thinking = [
+            pb_varint(3, 99),
+            pb_varint(9, 5),
+            pb_bytes(11, b"wrong-thinking"),
+        ]
+        .concat();
+        let wrong_zero = [pb_varint(3, 5), pb_bytes(11, b"wrong-zero")].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                generation_blob(&[1], "m", &[thinking_only]),
+                generation_blob(&[1], "m", &[response_only]),
+                generation_blob(&[1], "m", &[Vec::new()]),
+                generation_blob(&[1], "m", &[wrong_thinking]),
+                generation_blob(&[1], "m", &[wrong_zero]),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 0);
+        assert_eq!(diagnostics.total_mismatches, 2);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].event_key, "response:thinking");
+        assert_eq!(events[0].tokens.output, 5);
+        assert_eq!(events[0].tokens.reasoning_output, 5);
+        assert_eq!(events[1].event_key, "response:response");
+        assert_eq!(events[1].tokens.reasoning_output, 0);
+    }
+
+    #[test]
+    fn malformed_packed_step_indices_do_not_use_the_valid_prefix() {
+        let test = TestDirectory::new("packed-partial");
+        let path = test.0.join("cascade-packed.db");
+        let usage = usage_blob(1, 0, 0, 1, "truncated-indices");
+        let truncated = [pb_bytes(1, &pb_bytes(4, &usage)), pb_bytes(2, &[1, 0x80])].concat();
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[
+                truncated,
+                generation_blob(&[1], "m", &[usage_blob(1, 0, 0, 1, "valid-indices")]),
+            ],
+        );
+        let (_, events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert_eq!(diagnostics.malformed_lines, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_key, "response:valid-indices");
+    }
+
+    #[test]
+    fn wal_commit_between_table_reads_is_visible_only_to_the_next_scan() {
+        let test = TestDirectory::new("wal-snapshot");
+        let path = test.0.join("cascade-wal.db");
+        let created = 1_791_239_681;
+        write_conversation(
+            &path,
+            &[(1, step_blob(created, 0))],
+            &[generation_blob(
+                &[1],
+                "m",
+                &[usage_blob(1, 0, 0, 1, "before")],
+            )],
+        );
+        let mut writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::from_secs(2)).unwrap();
+        let (_, initial_events, diagnostics) =
+            parse_local_database_with_step_read(&path, 0, || {
+                let transaction = writer.transaction().unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
+                        [step_blob(created + 1, 0)],
+                    )
+                    .unwrap();
+                let data = generation_blob(&[2], "m", &[usage_blob(2, 0, 0, 1, "after")]);
+                transaction
+                    .execute(
+                        "INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?1, ?2)",
+                        rusqlite::params![&data, data.len() as i64],
+                    )
+                    .unwrap();
+                // WAL 中即使读事务还没结束，也允许另一个连接提交。
+                transaction.commit().unwrap();
+            })
+            .unwrap();
+        assert!(!diagnostics.is_partial(), "{diagnostics:?}");
+        assert_eq!(initial_events.len(), 1);
+        assert_eq!(initial_events[0].event_key, "response:before");
+
+        let (_, next_events, diagnostics) = parse_local_database(&path, 0).unwrap();
+        assert!(!diagnostics.is_partial(), "{diagnostics:?}");
+        assert_eq!(next_events.len(), 2);
+        assert_eq!(next_events[1].event_key, "response:after");
+        assert_eq!(next_events[1].occurred_at_ms, (created + 1) as i64 * 1000);
+    }
+
+    #[test]
+    fn local_rows_before_the_cutoff_are_dropped() {
+        let test = TestDirectory::new("cutoff");
+        let path = test.0.join("cascade-cutoff.db");
+        write_conversation(
+            &path,
+            &[
+                (1, step_blob(1_791_000_000, 0)),
+                (3, step_blob(1_791_100_000, 0)),
+            ],
+            &[
+                generation_blob(&[1], "m", &[usage_blob(1, 0, 0, 1, "old")]),
+                generation_blob(&[3], "m", &[usage_blob(1, 0, 0, 1, "new")]),
+            ],
+        );
+        let (_, events, _) = parse_local_database(&path, 1_791_050_000_000).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_key, "response:new");
+    }
+
+    #[test]
+    fn local_databases_skip_wal_sidecars_and_other_files() {
+        let test = TestDirectory::new("discover");
+        for name in [
+            "b.db",
+            "a.db",
+            "a.db-wal",
+            "a.db-shm",
+            "old.pb",
+            "notes.txt",
+        ] {
+            std::fs::write(test.0.join(name), b"").unwrap();
+        }
+        let adapter =
+            AntigravityAdapter::with_conversation_dirs(vec![test.0.clone(), test.0.join("absent")]);
+        let names: Vec<String> = adapter
+            .local_databases()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.db", "b.db"]);
+    }
+
+    #[test]
+    fn rpc_skips_cascades_that_have_a_local_database() {
+        let list = json!({ "trajectorySummaries": [
+            { "cascadeId": "on-disk", "lastModifiedTime": 1784000000000i64, "stepCount": 3 },
+            { "cascadeId": "rpc-only", "lastModifiedTime": 1784000000000i64, "stepCount": 5 }
+        ]});
+        let local_ids: HashSet<&str> = ["on-disk"].into_iter().collect();
+        let candidates = rpc_candidates(&list, &local_ids);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].path,
+            PathBuf::from("antigravity://cascade/rpc-only")
+        );
+        assert_eq!(candidates[0].size, 5);
+    }
+
+    #[test]
+    fn proto_reader_rejects_truncated_input_and_reads_packed_and_plain_repeats() {
+        assert!(ProtoMessage::parse(&[0x0a, 0x05, 0x01]).is_none());
+        assert!(ProtoMessage::parse(&[0xff, 0xff]).is_none());
+        let bytes = [
+            pb_bytes(2, &[0x01, 0x96, 0x01]),
+            pb_varint(2, 7),
+            pb_varint(9, 3),
+        ]
+        .concat();
+        let message = ProtoMessage::parse(&bytes).unwrap();
+        assert_eq!(message.repeated_varints(2), Some(vec![1u64, 150, 7]));
+        assert_eq!(message.varint(9), Some(3));
+        assert_eq!(message.varint(8), None);
+        assert_eq!(
+            ProtoMessage::parse(&pb_bytes(2, &[1, 0x80]))
+                .unwrap()
+                .repeated_varints(2),
+            None
+        );
+    }
+
+    #[test]
+    fn proto_reader_rejects_varint_overflow_and_invalid_field_numbers() {
+        let mut max = vec![0xff; 9];
+        max.push(1);
+        assert_eq!(read_varint(&max, &mut 0), Some(u64::MAX));
+        max[9] = 2;
+        assert_eq!(read_varint(&max, &mut 0), None);
+        assert!(ProtoMessage::parse(&pb_varint(0, 1)).is_none());
+        assert!(ProtoMessage::parse(&pb_varint(1 << 29, 1)).is_none());
     }
 
     #[test]

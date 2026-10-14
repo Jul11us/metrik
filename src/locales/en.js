@@ -594,7 +594,7 @@ export default {
   "Kimi 本地 Token": "Kimi local tokens",
   "只计单轮增量记录（会话累计记录会重复计数）；未安装 Kimi 时保持为 0。": "Counts only per-turn increments (cumulative session records would double count). Stays at 0 if Kimi isn't installed.",
   "Antigravity 用量": "Antigravity usage",
-  "来自本机 language server 实时 RPC；IDE 未运行时为 0，不估算。尚未实机验收。": "Comes from the local language server's live RPC. It's 0 while the IDE isn't running and is never estimated. Not yet verified on a real machine.",
+  "读取本地会话库（Antigravity 2.x，应用未运行也能读到）；旧版 IDE 的会话在 IDE 运行时经本机 language server RPC 读取。不估算。": "Reads the local conversation databases (Antigravity 2.x, even while the app is closed). Sessions from older IDE builds are read through the local language server's RPC while the IDE is running. Never estimated.",
   "WorkBuddy 本地 Token": "WorkBuddy local tokens",
   "读取 CodeBuddy/WorkBuddy 会话转录的 usage 字段并以消息标识去重；未安装时保持为 0。": "Reads the usage field of CodeBuddy/WorkBuddy session transcripts and deduplicates by message ID. Stays at 0 if not installed.",
   "覆盖 Qoder、QoderWork 与 Qoder CLI 的账户级额度；设置 QODER_COOKIE 环境变量后读取官网额度，不把本地零 token 遥测当作用量。":

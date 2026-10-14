@@ -21,9 +21,11 @@ pub const PARSER_VERSION: i64 = 7;
 
 /// 只影响单个 adapter 的升级不必重扫全部来源。
 /// Pi 8 重扫 pi 来源，让 kimi-coding / openai-codex 路由的用量改记到 Kimi / Codex 卡片。
+/// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整。
 pub fn parser_version_for(adapter: &str) -> i64 {
     match adapter {
         "codex" | "pi" => 8,
+        "antigravity" => 9,
         _ => PARSER_VERSION,
     }
 }
@@ -1282,6 +1284,41 @@ mod tests {
             .unwrap();
 
         assert!(!source_is_current(&connection, "pi-session", 10, 1, 0).unwrap());
+    }
+
+    #[test]
+    fn antigravity_sources_rescan_after_decoder_diagnostics_change() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        for (id, adapter, version) in [
+            ("ag-cascade", "antigravity", PARSER_VERSION),
+            ("ag-project", "antigravity", 8),
+            ("claude-session", "claude", PARSER_VERSION),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO scan_source (
+                        source_id, adapter_id, logical_key, locator, observed_size,
+                        mtime_ns, coverage_start_ms, parser_version, last_success_ms, last_error
+                     ) VALUES (?1, ?2, ?1, 'source.db', 20, 1, 0, ?3, 1, NULL)",
+                    params![id, adapter, version],
+                )
+                .unwrap();
+        }
+
+        assert!(!source_is_current(&connection, "ag-cascade", 20, 1, 0).unwrap());
+        assert!(!source_is_current(&connection, "ag-project", 20, 1, 0).unwrap());
+        assert!(source_is_current(&connection, "claude-session", 20, 1, 0).unwrap());
+
+        replace_source(
+            &mut connection,
+            &source("ag-cascade", "antigravity", Vec::new()),
+            0,
+        )
+        .unwrap();
+        assert!(source_is_current(&connection, "ag-cascade", 20, 1, 0).unwrap());
     }
 
     #[test]
