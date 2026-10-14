@@ -21,11 +21,12 @@ pub const PARSER_VERSION: i64 = 7;
 
 /// 只影响单个 adapter 的升级不必重扫全部来源。
 /// Pi 8 重扫 pi 来源，让 kimi-coding / openai-codex 路由的用量改记到 Kimi / Codex 卡片。
-/// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整。
+/// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整；
+/// 10 再重扫一次本地会话库，给已入账的历史用量回填项目归属（只填空值）。
 pub fn parser_version_for(adapter: &str) -> i64 {
     match adapter {
         "codex" | "pi" => 8,
-        "antigravity" => 9,
+        "antigravity" => 10,
         _ => PARSER_VERSION,
     }
 }
@@ -1284,6 +1285,27 @@ mod tests {
             .unwrap();
 
         assert!(!source_is_current(&connection, "pi-session", 10, 1, 0).unwrap());
+    }
+
+    /// 项目归属是后补的：v0.22.4（解析版本 9）入账的会话不重扫，文件不再变化的
+    /// 老会话永远补不上。
+    #[test]
+    fn antigravity_sources_parsed_before_project_attribution_are_reparsed() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO scan_source (
+                    source_id, adapter_id, logical_key, locator, observed_size,
+                    mtime_ns, coverage_start_ms, parser_version, last_success_ms, last_error
+                 ) VALUES ('ag-cascade', 'antigravity', 'ag-cascade', 'ag.db', 10, 1, 0, 9, 0, NULL)",
+                [],
+            )
+            .unwrap();
+
+        assert!(!source_is_current(&connection, "ag-cascade", 10, 1, 0).unwrap());
     }
 
     #[test]
