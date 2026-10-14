@@ -204,7 +204,7 @@ impl AgentAdapter for AntigravityAdapter {
 /// 会话库仍决定来源身份、排序时间和保留期；摘要库是项目归属的额外依赖。
 /// 将摘要库与 WAL 的各自状态写入不透明 size 指纹，不能只取最大 mtime：
 /// 会话库的时间可能较新，掩盖后到的摘要。SHM 是读者也会改写的协调文件，
-/// 不纳入摘要指纹，避免解析本身触发下一轮重扫。
+/// 不纳入摘要指纹；只读创建的空 WAL 与没有 WAL 等价，避免解析触发重扫。
 fn local_conversation_candidate(database: &Path, cutoff_ms: i64) -> Vec<SourceCandidate> {
     let mut candidates = super::sqlite_candidate(database, "antigravity", cutoff_ms);
     for candidate in &mut candidates {
@@ -214,6 +214,9 @@ fn local_conversation_candidate(database: &Path, cutoff_ms: i64) -> Vec<SourceCa
                 let mut path = summaries.as_os_str().to_os_string();
                 path.push(suffix);
                 match std::fs::metadata(PathBuf::from(path)) {
+                    Ok(metadata) if suffix == "-wal" && metadata.len() == 0 => {
+                        fingerprint.push_str("|-wal:missing");
+                    }
                     Ok(metadata) => fingerprint.push_str(&format!(
                         "|{suffix}:{}:{}",
                         metadata.len(),
@@ -708,20 +711,30 @@ fn conversation_workspace(conversation_db: &Path, cascade_id: &str) -> Option<St
 /// `workspace_uris` 是 JSON 字符串数组，元素是 VS Code 风格的 file URI
 /// （`file:///c%3A/Users/me/proj`）。取第一个本机 file URI 转成路径：本机
 /// 20 个会话都只有一个根，多根工作区没见过，取第一个根。远程、WSL 等其他
-/// 方案或带主机名的 URI 不猜，返回 None。
+/// 方案、带主机名、UNC、查询/片段与控制字符不猜，继续尝试下一个根。
 fn workspace_path(uris: &str) -> Option<String> {
     let uris: Vec<String> = serde_json::from_str(uris).ok()?;
-    uris.iter().find_map(|uri| {
-        let path = percent_decode(uri.strip_prefix("file:///")?)?;
-        // Windows 盘符路径（`c:/Users/...`）原样即可，Unix 路径补回根斜杠。
-        let windows_drive =
-            matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
-        Some(if windows_drive {
-            path
-        } else {
-            format!("/{path}")
-        })
-    })
+    uris.iter().find_map(|uri| local_file_uri_path(uri))
+}
+
+fn local_file_uri_path(uri: &str) -> Option<String> {
+    let encoded_path = uri.strip_prefix("file:///")?;
+    // 先判断 URI 分量再解码：编码的 %23/%3F 是文件名，原始 #/? 是其他分量。
+    if encoded_path.contains(['#', '?', '\\']) || uri.chars().any(char::is_control) {
+        return None;
+    }
+    let path = percent_decode(encoded_path)?;
+    // file:////host 与编码的根分隔符都可能变成 UNC；反斜杠的含义也不猜。
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return None;
+    }
+    let windows_drive = matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
+    if windows_drive {
+        // 只接受绝对盘符路径，不能把 c:relative 当成一个记录过的项目目录。
+        (path.as_bytes().get(2) == Some(&b'/')).then_some(path)
+    } else {
+        Some(format!("/{path}"))
+    }
 }
 
 /// URI 的百分号解码。非法转义或解出非 UTF-8 时返回 None，不产出半截路径。
@@ -2070,6 +2083,124 @@ mod tests {
     }
 
     #[test]
+    fn empty_summary_wal_reads_keep_cached_usage_current_but_real_writes_do_not() {
+        let test = TestDirectory::new("empty-summary-wal");
+        let conversations = test.0.join("conversations");
+        std::fs::create_dir_all(&conversations).unwrap();
+        let path = conversations.join("cached.db");
+        write_conversation(
+            &path,
+            &[(1, step_blob(1_791_239_681, 0))],
+            &[generation_blob(
+                &[1],
+                "m",
+                &[usage_blob(10, 0, 1, 1, "resp-cached")],
+            )],
+        );
+        let conversation_reader = Connection::open(&path).unwrap();
+        conversation_reader
+            .execute_batch("SELECT COUNT(*) FROM gen_metadata;")
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(86_400)),
+            )
+            .unwrap();
+
+        let summaries_path = conversation_summaries_path(&path).unwrap();
+        let summaries = Connection::open(&summaries_path).unwrap();
+        summaries
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY,
+                     workspace_uris text NOT NULL);
+                 INSERT INTO conversation_summaries VALUES
+                     ('cached', '[\"file:///d%3A/work/original\"]');",
+            )
+            .unwrap();
+        drop(summaries);
+        let mut wal_path = summaries_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+        assert!(!wal_path.exists());
+        let candidate = || local_conversation_candidate(&path, 0).remove(0);
+        let adapter = AntigravityAdapter::with_conversation_dirs(vec![conversations]);
+        let mut ledger = Connection::open_in_memory().unwrap();
+        ledger
+            .execute_batch(include_str!("../../migrations/001_init.sql"))
+            .unwrap();
+        let initial = candidate();
+        let scan = adapter.parse(&initial, 0).unwrap();
+        crate::storage::replace_source(&mut ledger, &scan.source, 0).unwrap();
+        let is_current = |ledger: &Connection| {
+            let next = candidate();
+            crate::storage::source_is_current(ledger, &next.source_id, next.size, next.mtime_ns, 0)
+                .unwrap()
+        };
+
+        // 真实的只读打开创建空 WAL；下一次发现不能因此重复读取所有会话。
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert!(is_current(&ledger));
+        std::fs::remove_file(&wal_path).unwrap();
+        assert!(is_current(&ledger));
+        let empty_wal = std::fs::File::create(&wal_path).unwrap();
+        empty_wal
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(172_800)),
+            )
+            .unwrap();
+        drop(empty_wal);
+        assert!(is_current(&ledger));
+
+        let summaries = Connection::open(&summaries_path).unwrap();
+        summaries
+            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        let main_before = std::fs::metadata(&summaries_path).unwrap();
+        summaries
+            .execute(
+                "UPDATE conversation_summaries SET workspace_uris = ?1 WHERE conversation_id = ?2",
+                rusqlite::params![r#"["file:///d%3A/work/renamed"]"#, "cached"],
+            )
+            .unwrap();
+        let main_after = std::fs::metadata(&summaries_path).unwrap();
+        assert_eq!(main_before.len(), main_after.len());
+        assert_eq!(
+            main_before.modified().unwrap(),
+            main_after.modified().unwrap()
+        );
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        assert!(!is_current(&ledger));
+        let updated = adapter.parse(&candidate(), 0).unwrap();
+        assert_eq!(
+            updated.source.events[0].project_path.as_deref(),
+            Some("D:/work/renamed")
+        );
+        assert_eq!(
+            updated.source.events[0].event_id,
+            scan.source.events[0].event_id
+        );
+        assert_eq!(
+            updated.source.events[0].tokens,
+            scan.source.events[0].tokens
+        );
+        crate::storage::replace_source(&mut ledger, &updated.source, 0).unwrap();
+        assert!(is_current(&ledger));
+        let stored_project: String = ledger
+            .query_row("SELECT project_path FROM usage_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stored_project, "D:/work/original",
+            "已记录的项目归属不能改写"
+        );
+    }
+
+    #[test]
     fn workspace_uris_decode_to_local_paths_and_never_guess() {
         assert_eq!(
             workspace_path(r#"["file:///c%3A/Users/me/DAVID%27s%20%E5%B0%B1%E4%B8%9A"]"#)
@@ -2092,6 +2223,50 @@ mod tests {
         assert_eq!(workspace_path(r#"["file:///c%3A/%FF"]"#), None);
         assert_eq!(workspace_path("[]"), None);
         assert_eq!(workspace_path(""), None);
+    }
+
+    #[test]
+    fn workspace_uris_reject_ambiguous_roots_and_try_the_next_recorded_local_path() {
+        let invalid = [
+            "file://server/share/project",
+            "file:////server/share/project",
+            "file://///server/share/project",
+            "file:///%2Fserver/share/project",
+            "file:///%5C%5Cserver/share/project",
+            "file:///c%3A/work/%5Cserver",
+            "file:///c%3A/work/project#fragment",
+            "file:///home/user/project?query",
+            "file:///c%3A/work/%00",
+            "file:///home/user/%0Aproject",
+            "file:///home/user/%7Fproject",
+            "file:///home/user/%C2%85project",
+            "file:///c:/work/\0project",
+            "file:///home/user/\nproject",
+            "file:///c:/work/\\project",
+            "file:///c:relative",
+            "file:///c%3A/bad%2",
+            "file:///c%3A/%FF",
+        ];
+        for uri in invalid {
+            assert_eq!(workspace_path(&json!([uri]).to_string()), None, "{uri:?}");
+            assert_eq!(
+                workspace_path(&json!([uri, "file:///d%3A/work/valid"]).to_string()).as_deref(),
+                Some("d:/work/valid"),
+                "{uri:?} 不能挡住后面的合法本地根"
+            );
+        }
+        for (uri, expected) in [
+            ("file:///", "/"),
+            ("file:///c%3A/", "c:/"),
+            ("file:///home/user/a%23b%3Fc", "/home/user/a#b?c"),
+            ("file:///home/user/%252Fproject", "/home/user/%2Fproject"),
+            ("file:///d%3A/work/%E9%A1%B9%E7%9B%AE%20A", "d:/work/项目 A"),
+        ] {
+            assert_eq!(
+                workspace_path(&json!([uri]).to_string()).as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

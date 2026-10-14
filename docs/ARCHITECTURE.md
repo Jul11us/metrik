@@ -74,7 +74,20 @@ updated after the conversation was scanned therefore backfills its project even
 when the conversation database is unchanged. Missing or removed summaries still
 leave usage readable; existing project attribution is retained. Summary SHM
 metadata is excluded because readers can change it without changing attribution.
+An absent summary WAL and a zero-byte WAL have the same fingerprint: a read-only
+SQLite open may create the latter without changing data. Non-empty WAL metadata
+still triggers reconciliation independently of the main database's timestamp.
 Conversation timestamps continue to determine discovery's retention cutoff.
+
+Workspace attribution accepts the recorded `file:///` URI form only. UNC-like
+roots, authorities, raw query or fragment delimiters, backslashes, and raw or
+decoded control characters are rejected before selecting the next recorded local
+root. Percent-encoded spaces, Unicode, `#`, and `?` remain filename characters;
+Windows drive paths must be absolute, while Unix paths retain their leading `/`.
+Established project paths are never overwritten. If an earlier development build
+already stored a malformed project label, an explicit derived-ledger rebuild is
+required to remove that label; a parser-version upgrade alone cannot repair a
+non-NULL attribution.
 
 ### Replayed history is not new usage
 
