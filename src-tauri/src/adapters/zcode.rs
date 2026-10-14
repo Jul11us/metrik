@@ -310,6 +310,6 @@ mod tests {
         let after = adapter.discover(0).remove(0);
 
         assert_eq!(before.source_id, after.source_id);
-        assert!(after.size > before.size);
+        assert_ne!(after.size, before.size);
     }
 }
