@@ -770,8 +770,19 @@ function Sidebar({ activeNav, onNavChange, snapshot, loading, nextRefreshAt }) {
   const partial = snapshotIsPartial(snapshot);
   const indexing = (snapshot.indexing?.pending || 0) > 0;
   const sourceStatus = sourceStatusCopy(snapshot, loading, partial);
-  // 下次自动刷新只放进悬停说明：状态行高度固定、不换行，不能塞会变的文字。
-  const statusTitle = nextRefreshAt
+  const statusAnchor = useRef(null);
+  const [tooltipDismissed, setTooltipDismissed] = useState(false);
+  useEffect(() => {
+    const dismissTooltip = (event) => {
+      if (event.key === "Escape" && statusAnchor.current?.matches(":hover, :focus-within")) {
+        setTooltipDismissed(true);
+      }
+    };
+    document.addEventListener("keydown", dismissTooltip);
+    return () => document.removeEventListener("keydown", dismissTooltip);
+  }, []);
+  // 状态行保持定高；完整说明同时支持悬停和键盘焦点。更新中不显示旧计划时间。
+  const statusDescription = nextRefreshAt && !loading && !snapshot.pending && !indexing
     ? `${sourceStatus.detail}\n${t("下次自动刷新约 {time}", {
         time: formatClock(new Date(nextRefreshAt).toISOString()),
       })}`
@@ -797,19 +808,28 @@ function Sidebar({ activeNav, onNavChange, snapshot, loading, nextRefreshAt }) {
         ))}
       </nav>
 
-      {/* 这块是数据来源页的入口，主标题恒为「数据统计」；状态由上方的灯和下面
-          那行承担。两行都不换行、高度固定：文案随状态变长会把整条导航顶得上下
-          跳。完整说明放 title。 */}
-      <button
-        className="source-status"
-        type="button"
-        onClick={() => onNavChange("sources")}
-        title={statusTitle}
+      {/* 状态入口保持两行定高，说明浮在侧栏旁边，不挤动导航。 */}
+      <div
+        ref={statusAnchor}
+        className="source-status-anchor"
+        data-tooltip-dismissed={tooltipDismissed || undefined}
+        onMouseEnter={() => setTooltipDismissed(false)}
+        onFocusCapture={() => setTooltipDismissed(false)}
       >
-        <span className={`status-dot ${loading || indexing ? "status-dot--loading" : ""} ${snapshot.loadError ? "status-dot--error" : ""} ${partial && !indexing ? "status-dot--warning" : ""}`} />
-        <span>{t("数据统计")}</span>
-        <small>{sourceStatus.state}</small>
-      </button>
+        <button
+          className="source-status"
+          type="button"
+          onClick={() => onNavChange("sources")}
+          aria-describedby="source-status-tooltip"
+        >
+          <span className={`status-dot ${loading || indexing ? "status-dot--loading" : ""} ${snapshot.loadError ? "status-dot--error" : ""} ${partial && !indexing ? "status-dot--warning" : ""}`} />
+          <span>{t("数据统计")}</span>
+          <small>{sourceStatus.state}</small>
+        </button>
+        <span id="source-status-tooltip" className="tooltip-label source-status-tooltip" role="tooltip">
+          {statusDescription}
+        </span>
+      </div>
     </aside>
   );
 }
