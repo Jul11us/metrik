@@ -465,8 +465,8 @@ export default {
   "项目列表": "Projects",
   "{count} 个会话": ({ count }) => `${count} ${count === 1 ? "session" : "sessions"}`,
   "估算 ≈{usd}": "est. ≈{usd}",
-  "这些会话的来源不带工作目录（如 Antigravity），无法归入项目。 {count} 个会话。": ({ count }) =>
-    `These sessions come from sources without a working directory (such as Antigravity), so they can't be assigned to a project. ${count} ${count === 1 ? "session" : "sessions"}.`,
+  "这些会话的来源不带工作目录（如 Cursor），无法归入项目。 {count} 个会话。": ({ count }) =>
+    `These sessions come from sources without a working directory (such as Cursor), so they can't be assigned to a project. ${count} ${count === 1 ? "session" : "sessions"}.`,
   "按模型筛选": "Filter by model",
   "全部模型": "All models",
   "导出会话 CSV（{count}）": "Export sessions CSV ({count})",

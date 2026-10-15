@@ -4216,7 +4216,7 @@ function UsageSection({ projectsState, sessionsState, period, onRulesChanged }) 
                 {detailMeta?.usd != null ? ` · ${t("估算 ≈{usd}", { usd: formatUsd(detailMeta.usd) })}` : ""}
               </>
             ) : (
-              <>{t("这些会话的来源不带工作目录（如 Antigravity），无法归入项目。 {count} 个会话。", { count: scoped.length })}</>
+              <>{t("这些会话的来源不带工作目录（如 Cursor），无法归入项目。 {count} 个会话。", { count: scoped.length })}</>
             )}
           </p>
         </header>

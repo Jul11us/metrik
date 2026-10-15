@@ -21,11 +21,12 @@ pub const PARSER_VERSION: i64 = 7;
 
 /// 只影响单个 adapter 的升级不必重扫全部来源。
 /// Pi 8 重扫 pi 来源，让 kimi-coding / openai-codex 路由的用量改记到 Kimi / Codex 卡片。
-/// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整。
+/// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整；
+/// 10 再重扫一次本地会话库，给已入账的历史用量回填项目归属（只填空值）。
 pub fn parser_version_for(adapter: &str) -> i64 {
     match adapter {
         "codex" | "pi" => 8,
-        "antigravity" => 9,
+        "antigravity" => 10,
         _ => PARSER_VERSION,
     }
 }
@@ -134,6 +135,30 @@ pub fn remove_adapter_ledger(connection: &mut Connection, adapter_id: &str) -> R
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+/// 项目归属回填只填空值（见事件写入的 fills_missing_project），已存的标签任何
+/// 解析器升级都改写不了。Antigravity 的标签只被 URI 校验落定前的开发构建写过
+/// （发布版本从未写过），所以这里可以一次性清空全部 Antigravity 归属，并把其
+/// 来源降回上一解析器版本强制重扫，由新校验重新归属。app_setting 保证每本账本
+/// 最多执行一次；返回是否执行了清理。
+pub fn repair_antigravity_project_attribution(connection: &mut Connection) -> Result<bool> {
+    const REPAIR_SETTING_KEY: &str = "antigravity.project_attribution_repair";
+    if get_app_setting(connection, REPAIR_SETTING_KEY)?.is_some() {
+        return Ok(false);
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE usage_event SET project_path = NULL WHERE adapter_id = 'antigravity'",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE scan_source SET parser_version = ?1 WHERE adapter_id = 'antigravity'",
+        [parser_version_for("antigravity") - 1],
+    )?;
+    set_app_setting(&transaction, REPAIR_SETTING_KEY, "done")?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 pub fn get_app_setting(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -1284,6 +1309,101 @@ mod tests {
             .unwrap();
 
         assert!(!source_is_current(&connection, "pi-session", 10, 1, 0).unwrap());
+    }
+
+    /// 项目归属是后补的：v0.22.4（解析版本 9）入账的会话不重扫，文件不再变化的
+    /// 老会话永远补不上。
+    #[test]
+    fn antigravity_sources_parsed_before_project_attribution_are_reparsed() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO scan_source (
+                    source_id, adapter_id, logical_key, locator, observed_size,
+                    mtime_ns, coverage_start_ms, parser_version, last_success_ms, last_error
+                 ) VALUES ('ag-cascade', 'antigravity', 'ag-cascade', 'ag.db', 10, 1, 0, 9, 0, NULL)",
+                [],
+            )
+            .unwrap();
+
+        assert!(!source_is_current(&connection, "ag-cascade", 10, 1, 0).unwrap());
+    }
+
+    /// 开发构建写坏的 Antigravity 标签无法靠升级改写：启动清理把它清空并降版
+    /// 强制重扫，别的 Agent 不受影响，第二次启动不再动作。
+    #[test]
+    fn antigravity_project_labels_are_cleared_once_for_repair() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        for (event_id, adapter, project) in [
+            ("ag-1", "antigravity", Some("bad\\label")),
+            ("cl-1", "claude", Some("/home/me/keep")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO usage_event (
+                        event_id, adapter_id, event_key, occurred_at_ms, session_id,
+                        input_uncached_tokens, cache_read_tokens, cache_write_tokens,
+                        output_tokens, reasoning_tokens, processed_tokens, quality,
+                        payload_hash, project_path
+                     ) VALUES (?1, ?2, ?1, 0, 's', 1, 0, 0, 1, 0, 1, 'exact', 'h', ?3)",
+                    params![event_id, adapter, project],
+                )
+                .unwrap();
+        }
+        for (source_id, adapter, version) in [
+            (
+                "ag-source",
+                "antigravity",
+                parser_version_for("antigravity"),
+            ),
+            ("cl-source", "claude", PARSER_VERSION),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO scan_source (
+                        source_id, adapter_id, logical_key, locator, observed_size,
+                        mtime_ns, coverage_start_ms, parser_version, last_success_ms, last_error
+                     ) VALUES (?1, ?2, ?1, 'x', 1, 1, 0, ?3, 0, NULL)",
+                    params![source_id, adapter, version],
+                )
+                .unwrap();
+        }
+
+        assert!(repair_antigravity_project_attribution(&mut connection).unwrap());
+        let ag_label: Option<String> = connection
+            .query_row(
+                "SELECT project_path FROM usage_event WHERE event_id = 'ag-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ag_label, None);
+        let cl_label: String = connection
+            .query_row(
+                "SELECT project_path FROM usage_event WHERE event_id = 'cl-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cl_label, "/home/me/keep");
+        let ag_version: i64 = connection
+            .query_row(
+                "SELECT parser_version FROM scan_source WHERE source_id = 'ag-source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ag_version, parser_version_for("antigravity") - 1);
+        assert!(!source_is_current(&connection, "ag-source", 1, 1, 0).unwrap());
+        assert!(source_is_current(&connection, "cl-source", 1, 1, 0).unwrap());
+
+        assert!(!repair_antigravity_project_attribution(&mut connection).unwrap());
     }
 
     #[test]

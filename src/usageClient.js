@@ -536,7 +536,7 @@ function demoProjects(period = "today") {
     totalProjects: projects.length,
     truncated: false,
     unattributedTokens: 1_900_000,
-    unattributedAgents: ["antigravity"],
+    unattributedAgents: ["cursor"],
     hiddenTokens,
     isDemo: true,
     loadError: false,
