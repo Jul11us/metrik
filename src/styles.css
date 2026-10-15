@@ -2267,6 +2267,32 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
   transform: translateX(0);
 }
 
+.source-status-anchor {
+  position: relative;
+  width: 100%;
+  margin-top: auto;
+}
+
+.source-status-tooltip {
+  left: calc(100% - 8px);
+  bottom: 16px;
+  z-index: 1;
+  width: 280px;
+  max-width: calc(100vw - 144px);
+  line-height: 1.5;
+  text-align: left;
+  white-space: pre-line;
+  visibility: hidden;
+}
+
+.source-status-anchor:not([data-tooltip-dismissed="true"]):hover .source-status-tooltip,
+.source-status-anchor:not([data-tooltip-dismissed="true"]):focus-within .source-status-tooltip {
+  opacity: 1;
+  transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+}
+
 /* 状态灯居中压在文字正上方：灯是这块唯一的状态编码，摆在行首会被当成项目符号。 */
 .source-status {
   display: grid;
@@ -2275,7 +2301,6 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
   gap: 5px;
   width: 100%;
   min-height: 86px;
-  margin-top: auto;
   padding: 13px 15px 24px;
   color: #6d6f73;
   text-align: center;
@@ -4576,7 +4601,7 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
   .metric-line h1 { font-size: clamp(80px, 10vw, 105px); }
   .inspector { padding-inline: 24px; }
 
-  /* 窄侧栏：缩字号，保证整词放得下，不再截成"数据不…"。完整说明仍在 title 里。 */
+  /* 窄侧栏：缩字号，保证整词放得下；完整说明浮在侧栏旁边。 */
   .source-status {
     gap: 4px;
     padding-inline: 10px;
@@ -4630,7 +4655,7 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
   .nav-stack { flex-direction: row; gap: 2px; margin: 0 0 0 auto; }
   .nav-button { width: 43px; height: 43px; }
   .nav-button svg { width: 23px; }
-  .nav-dot, .tooltip-label, .source-status { display: none; }
+  .nav-dot, .tooltip-label, .source-status-anchor { display: none; }
 
   .period-control {
     position: relative;

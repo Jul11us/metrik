@@ -103,6 +103,7 @@ export default {
   "数据源正常": "Data sources OK",
   "更新中": "Updating",
   "更新于 {time}": "Updated {time}",
+  "下次自动刷新约 {time}": "Next automatic refresh around {time}",
   "各项数据均可溯源。": "Every figure can be traced to its source.",
   "数据统计": "Statistics",
   "正在读取本机数据": "Reading local data",
