@@ -54,6 +54,7 @@ use walkdir::WalkDir;
 pub struct SourceCandidate {
     pub source_id: String,
     pub path: PathBuf,
+    /// 文件来源是字节数；SQLite 来源是 DB/WAL 各自元数据的稳定变更指纹。
     pub size: u64,
     pub mtime_ns: i64,
 }
@@ -302,8 +303,14 @@ pub(super) fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 /// 单个 SQLite 库作为一个源。WAL 模式下写入先进 -wal，主库文件的 mtime/size
-/// 可能长期不变：把库与 -wal/-shm 的状态合并成一个变更指纹，任何一个变化都会
-/// 触发重扫。
+/// 可能长期不变：分别记录库与 -wal 的大小、mtime，再哈希成变更指纹。
+/// 不能只相加大小、取最大 mtime：主库时间戳领先时会掩盖同大小的 WAL 重写。
+///
+/// 只看真正承载数据的文件。`-shm` 只是共享内存索引，连只读连接都会改写它
+/// （读锁标记），只读打开时 SQLite 还会建出空的 `-wal`——把它们算进来，
+/// Metrik 自己每读一次库，下一轮快照就以为库变了，没变的库每轮都被重扫。
+/// 空的 `-wal` 不含任何帧；新数据要么写进非空的 `-wal`，要么经检查点写回
+/// 主库（主库 mtime 随之变化），两种都仍会被看到。
 pub(super) fn sqlite_candidate(
     database: &Path,
     adapter_id: &str,
@@ -312,19 +319,28 @@ pub(super) fn sqlite_candidate(
     let Ok(metadata) = database.metadata() else {
         return Vec::new();
     };
-    let mut size = metadata.len();
-    let mut mtime_ns = file_mtime_ns(&metadata);
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = database.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        if let Ok(sidecar_meta) = std::fs::metadata(PathBuf::from(sidecar)) {
-            size += sidecar_meta.len();
-            mtime_ns = mtime_ns.max(file_mtime_ns(&sidecar_meta));
+    let database_size = metadata.len();
+    let database_mtime_ns = file_mtime_ns(&metadata);
+    let (mut wal_size, mut wal_mtime_ns) = (0, 0);
+    let mut wal = database.as_os_str().to_os_string();
+    wal.push("-wal");
+    if let Ok(wal_meta) = std::fs::metadata(PathBuf::from(wal)) {
+        if wal_meta.len() > 0 {
+            wal_size = wal_meta.len();
+            wal_mtime_ns = file_mtime_ns(&wal_meta);
         }
     }
+    let mtime_ns = database_mtime_ns.max(wal_mtime_ns);
     if mtime_ns / 1_000_000 < cutoff_ms {
         return Vec::new();
     }
+    // size 在 SQLite 来源中是现有 observed_size 缓存槽里的不透明指纹；mtime
+    // 仍是实际文件时间，供发现 cutoff 与队列排序使用。空/不存在的 WAL 均为 0|0。
+    let fingerprint = stable_hash(&format!(
+        "sqlite-metadata-v1|{database_size}|{database_mtime_ns}|{wal_size}|{wal_mtime_ns}"
+    ));
+    let size = u64::from_str_radix(&fingerprint[..16], 16)
+        .expect("stable_hash returns lowercase hexadecimal SHA-256");
     let normalized = normalize_locator(database);
     vec![SourceCandidate {
         source_id: stable_hash(&format!("{adapter_id}|{normalized}")),
@@ -407,5 +423,186 @@ mod tests {
             ScanDiagnostics::from_storage_marker(&diagnostics.storage_marker().unwrap()),
             Some(diagnostics)
         );
+    }
+
+    /// 只读打开 WAL 库会改写 `-shm`（读锁标记），首次打开还会建出空的 `-wal`。
+    /// 这些都不是数据变化：算进指纹的话，Metrik 自己读一次，下次快照就会把
+    /// 没变的库再解析一遍，每轮刷新都重扫全部 SQLite 来源。
+    #[test]
+    fn reading_a_wal_database_does_not_change_its_fingerprint() {
+        let dir = std::env::temp_dir().join(format!(
+            "metrik-sqlite-fingerprint-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("source.db");
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE t (v INTEGER);
+                 INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        drop(writer);
+
+        let fingerprint = || {
+            let candidate = &sqlite_candidate(&database, "test", 0)[0];
+            (candidate.size, candidate.mtime_ns)
+        };
+        let read = || {
+            let reader =
+                Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            reader
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap();
+        };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let before = fingerprint();
+        for _ in 0..2 {
+            pause();
+            read();
+            assert_eq!(fingerprint(), before, "只读不能让来源看起来变了");
+        }
+
+        // 真正的写入仍然要看得见：写入期间在 -wal 里，关闭后检查点写回主库。
+        pause();
+        let writer = Connection::open(&database).unwrap();
+        writer.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        assert_ne!(fingerprint(), before, "-wal 里的新数据必须改变指纹");
+        drop(writer);
+        assert_ne!(fingerprint(), before, "检查点写回主库后仍然是变化");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sqlite_fingerprint_ignores_shm_and_empty_wal_sidecar_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "metrik-sqlite-sidecar-fingerprint-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("source.db");
+        let shm = dir.join("source.db-shm");
+        let wal = dir.join("source.db-wal");
+        // 文件元数据层的测试不依赖 SQLite 是否在当前平台更新读锁的 mtime。
+        std::fs::write(&database, b"database").unwrap();
+        let fingerprint = || {
+            let candidate = &sqlite_candidate(&database, "test", 0)[0];
+            (candidate.size, candidate.mtime_ns)
+        };
+        let before = fingerprint();
+        std::fs::write(&shm, b"read lock").unwrap();
+        assert_eq!(fingerprint(), before);
+        std::fs::write(&shm, b"changed read lock index").unwrap();
+        assert_eq!(fingerprint(), before);
+        std::fs::write(&wal, b"").unwrap();
+        assert_eq!(fingerprint(), before);
+        std::fs::remove_file(&wal).unwrap();
+        assert_eq!(fingerprint(), before);
+
+        std::fs::write(&wal, b"data frames").unwrap();
+        let with_frames = fingerprint();
+        assert_ne!(with_frames, before);
+        std::fs::write(&database, b"checkpointed database").unwrap();
+        assert_ne!(fingerprint(), with_frames);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_size_wal_rewrite_invalidates_cache_when_database_mtime_is_ahead() {
+        let dir = std::env::temp_dir().join(format!(
+            "metrik-sqlite-wal-reuse-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("source.db");
+        let wal = dir.join("source.db-wal");
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE t (v INTEGER);
+                 INSERT INTO t VALUES (1);
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 UPDATE t SET v = 2;
+                 PRAGMA wal_checkpoint(RESTART);",
+            )
+            .unwrap();
+        // 时钟回拨/保留时间戳的恢复都可能让主库时间领先后续 WAL 写入。
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&database)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        let candidate = || sqlite_candidate(&database, "test", 0).remove(0);
+        let source = |candidate: &SourceCandidate| ParsedSource {
+            source_id: candidate.source_id.clone(),
+            adapter_id: "test",
+            locator: candidate.path.clone(),
+            logical_key: "source".into(),
+            size: candidate.size,
+            mtime_ns: candidate.mtime_ns,
+            events: Vec::new(),
+            quotas: Vec::new(),
+        };
+        let current = |ledger: &Connection, candidate: &SourceCandidate| {
+            crate::storage::source_is_current(
+                ledger,
+                &candidate.source_id,
+                candidate.size,
+                candidate.mtime_ns,
+                0,
+            )
+            .unwrap()
+        };
+        let read = || {
+            let reader =
+                Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            reader
+                .query_row("SELECT v FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+
+        let mut ledger = crate::storage::open_database(&dir.join("ledger.db")).unwrap();
+        let before = candidate();
+        let before_wal = std::fs::metadata(&wal).unwrap();
+        assert!(before.mtime_ns > file_mtime_ns(&before_wal));
+        crate::storage::replace_source(&mut ledger, &source(&before), 0).unwrap();
+        assert!(current(&ledger, &before));
+        assert_eq!(read(), 2);
+        assert!(current(&ledger, &candidate()), "只读不能使缓存过期");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        writer.execute("UPDATE t SET v = 3", []).unwrap();
+        assert_eq!(read(), 3, "WAL 中的实际数据必须已经改变");
+        let after = candidate();
+        let after_wal = std::fs::metadata(&wal).unwrap();
+        assert_eq!(
+            before_wal.len(),
+            after_wal.len(),
+            "RESTART 后复用同大小 WAL"
+        );
+        assert_ne!(file_mtime_ns(&before_wal), file_mtime_ns(&after_wal));
+        assert_eq!(after.source_id, before.source_id);
+        assert_eq!(after.mtime_ns, before.mtime_ns, "最大 mtime 仍由主库决定");
+        assert_ne!(after.size, before.size, "独立 WAL 元数据必须改变指纹");
+        assert!(!current(&ledger, &after));
+
+        crate::storage::replace_source(&mut ledger, &source(&after), 0).unwrap();
+        assert_eq!(read(), 3);
+        assert!(current(&ledger, &candidate()), "重扫后只读保持缓存有效");
+        drop(ledger);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
