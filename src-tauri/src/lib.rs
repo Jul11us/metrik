@@ -2025,6 +2025,19 @@ pub fn run() {
                     "Metrik could not check the Antigravity CLI statusLine hook ({error:#})"
                 ),
             }
+            // Antigravity 的项目归属在 URI 校验落定前只被开发构建写过，回填只填
+            // 空值，脏标签无法靠解析器升级改写。启动时静默清一次，下一轮扫描按
+            // 新校验重新归属；app_setting 保证每本账本最多执行一次。
+            match storage::open_database(&database_path)
+                .and_then(|mut connection| {
+                    storage::repair_antigravity_project_attribution(&mut connection)
+                }) {
+                Ok(true) => eprintln!("Metrik cleared Antigravity project labels for reattribution"),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Metrik could not repair Antigravity project attribution ({error:#})"
+                ),
+            }
 
             app.manage(AppState {
                 database_path,

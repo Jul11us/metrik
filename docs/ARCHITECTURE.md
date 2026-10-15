@@ -84,10 +84,13 @@ roots, authorities, raw query or fragment delimiters, backslashes, and raw or
 decoded control characters are rejected before selecting the next recorded local
 root. Percent-encoded spaces, Unicode, `#`, and `?` remain filename characters;
 Windows drive paths must be absolute, while Unix paths retain their leading `/`.
-Established project paths are never overwritten. If an earlier development build
-already stored a malformed project label, an explicit derived-ledger rebuild is
-required to remove that label; a parser-version upgrade alone cannot repair a
-non-NULL attribution.
+Established project paths are never overwritten. A development build wrote
+project labels before the URI validation above landed, and a parser-version
+upgrade alone cannot repair a non-NULL label, so the first startup after this
+change clears every Antigravity label once and demotes Antigravity sources
+below the current parser version; the next scan re-derives the attribution
+from the validated summaries. An app setting keys this repair so it runs at
+most once per ledger.
 
 ### Replayed history is not new usage
 
