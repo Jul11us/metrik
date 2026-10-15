@@ -28,6 +28,7 @@ import {
   FunnelSimple,
   GearSix,
   HardDrives,
+  Info,
   Minus,
   PushPinSimple,
   ShieldCheck,
@@ -909,6 +910,53 @@ const TOKEN_COMPONENTS = [
   { key: "output", label: "输出", color: "#e36b49" },
 ];
 
+function ModelResponseSpeedHelp() {
+  const anchor = useRef(null);
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    const dismiss = (event) => {
+      if (event.key === "Escape" && anchor.current?.matches(":hover, :focus-within")) {
+        setDismissed(true);
+      }
+    };
+    document.addEventListener("keydown", dismiss);
+    return () => document.removeEventListener("keydown", dismiss);
+  }, []);
+  return (
+    <div
+      ref={anchor}
+      className="model-speed-help"
+      data-dismissed={dismissed || undefined}
+      onMouseEnter={() => setDismissed(false)}
+      onFocusCapture={() => setDismissed(false)}
+    >
+      <button type="button" className="model-speed-help-button" aria-describedby="model-speed-explanation">
+        {t("响应均速（含等待）")}
+        <Info size={13} weight="regular" aria-hidden="true" />
+      </button>
+      <span id="model-speed-explanation" role="tooltip" className="model-speed-tooltip">
+        {t("仅统计当前周期内有完整计时的已完成请求：输出 token 总和 ÷ 响应总耗时。耗时包含等待和思考；这是历史响应均速，不是纯生成速度或实时速度。")}
+      </span>
+    </div>
+  );
+}
+
+function ModelResponseSpeed({ entry }) {
+  const rate = entry.responseTokensPerSecond;
+  const count = entry.responseSampleCount;
+  const available = Number.isFinite(rate) && rate > 0 && Number.isInteger(count) && count > 0;
+  return (
+    <div className={`model-response-speed ${available ? "" : "model-response-speed--unavailable"}`}>
+      {available ? (
+        <>
+          <strong>{rate > 0 && rate < 0.1 ? "<0.1" : formatNumber(rate, { maximumFractionDigits: 1 })} <span>tokens/s</span></strong>
+          <small>{t("{count} 个有效样本", { count: formatNumber(count) })}</small>
+        </>
+      ) : <span>{t("暂无计时")}</span>}
+    </div>
+  );
+}
+
 // Token 构成 + 模型分布：都来自本地账本的精确解析（processed 口径，非账单）。
 function BreakdownSection({ snapshot, selectedAgent }) {
   const scopedAgents = selectedAgent === "all"
@@ -990,6 +1038,7 @@ function BreakdownSection({ snapshot, selectedAgent }) {
       {models.length > 0 && (
         <article className="breakdown-card">
           <h2>{t("模型分布")}</h2>
+          <ModelResponseSpeedHelp />
           <ul className="model-list">
             {models.map((entry) => (
               <li key={`${entry.agent}-${entry.model}`}>
@@ -1004,6 +1053,7 @@ function BreakdownSection({ snapshot, selectedAgent }) {
                   <i style={{ transform: `scaleX(${entry.tokens / modelMax})`, backgroundColor: AGENT_META[entry.agent]?.accent || "#74767a" }} />
                 </span>
                 <em>{compactTokens(entry.tokens)} · {entry.share.toFixed(1)}%</em>
+                <ModelResponseSpeed entry={entry} />
               </li>
             ))}
           </ul>
@@ -4925,7 +4975,8 @@ function ReportsSection({ report }) {
 
         <section className="report-card" aria-label={t("模型排行")}>
           <h2>{t("模型排行")}</h2>
-          <ul className="model-list">
+          <ModelResponseSpeedHelp />
+          <ul className="model-list model-list--response-speed">
             {(data.topModels || []).slice(0, 8).map((entry) => {
               const max = data.topModels[0]?.tokens || 1;
               return (
@@ -4936,6 +4987,7 @@ function ReportsSection({ report }) {
                     <i style={{ transform: `scaleX(${entry.tokens / max})`, backgroundColor: AGENT_META[entry.agent]?.accent || "#74767a" }} />
                   </span>
                   <em>{compactTokens(entry.tokens)}</em>
+                  <ModelResponseSpeed entry={entry} />
                 </li>
               );
             })}
