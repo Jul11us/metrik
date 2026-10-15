@@ -474,7 +474,7 @@ pub struct UsageProjects {
     pub total_projects: i64,
     pub truncated: bool,
     pub unattributed_tokens: i64,
-    /// 本周期内有用量、但当前版本读不到项目归属的 Agent（如 Antigravity）。
+    /// 本周期内有用量、但当前版本读不到项目归属的 Agent（如 Cursor 仪表盘用量）。
     pub unattributed_agents: Vec<String>,
     /// 命中隐藏规则（用户或内置）的用量。
     pub hidden_tokens: i64,
