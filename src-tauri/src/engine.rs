@@ -74,6 +74,47 @@ struct StoredEvent {
     model: Option<String>,
     comps: TokenComponents,
     request_input_tokens: Option<i64>,
+    response_duration_ms: Option<i64>,
+}
+
+/// 只在同一条请求记录同时带输出与有效耗时时计算响应速率。耗时包含等待、
+/// 预填充等响应生命周期，不是首末 token 之间的纯解码时间。
+#[derive(Default)]
+struct ModelAccrual {
+    tokens: i64,
+    response_output: f64,
+    response_duration_ms: f64,
+    response_sample_count: i64,
+}
+
+impl ModelAccrual {
+    fn add(&mut self, event: &StoredEvent) {
+        self.tokens += event.tokens;
+        let Some(duration) = event.response_duration_ms.filter(|duration| *duration > 0) else {
+            return;
+        };
+        if event.comps.output > 0 {
+            self.response_output += event.comps.output as f64;
+            self.response_duration_ms += duration as f64;
+            self.response_sample_count += 1;
+        }
+    }
+
+    fn into_summary(self, agent: String, model: String, total_tokens: i64) -> ModelSummary {
+        ModelSummary {
+            model,
+            agent,
+            tokens: self.tokens,
+            share: if total_tokens > 0 {
+                self.tokens as f64 * 100.0 / total_tokens as f64
+            } else {
+                0.0
+            },
+            response_tokens_per_second: (self.response_sample_count > 0)
+                .then(|| self.response_output * 1000.0 / self.response_duration_ms),
+            response_sample_count: self.response_sample_count,
+        }
+    }
 }
 
 /// 一个 Agent 在周期内的 processed token 分量拆解。远端同步事件不带分量，
@@ -250,7 +291,7 @@ fn report_at(connection: &Connection, local_now: chrono::DateTime<Local>) -> Res
         .iter()
         .map(|agent| (*agent, HashSet::new()))
         .collect();
-    let mut model_totals: HashMap<(String, String), i64> = HashMap::new();
+    let mut model_totals: HashMap<(String, String), ModelAccrual> = HashMap::new();
     let mut total_tokens: i64 = 0;
 
     for event in events {
@@ -283,9 +324,10 @@ fn report_at(connection: &Connection, local_now: chrono::DateTime<Local>) -> Res
             .filter(|value| !value.is_empty())
             .unwrap_or("unknown")
             .to_owned();
-        *model_totals
+        model_totals
             .entry(((*agent).to_owned(), model_key))
-            .or_insert(0) += event.tokens;
+            .or_default()
+            .add(&event);
     }
 
     let streak_days = compute_streak(&day_totals);
@@ -300,21 +342,9 @@ fn report_at(connection: &Connection, local_now: chrono::DateTime<Local>) -> Res
         })
         .collect();
 
-    let share = |tokens: i64| {
-        if total_tokens > 0 {
-            tokens as f64 * 100.0 / total_tokens as f64
-        } else {
-            0.0
-        }
-    };
     let mut top_models: Vec<ModelSummary> = model_totals
         .into_iter()
-        .map(|((agent, model), tokens)| ModelSummary {
-            model,
-            agent,
-            tokens,
-            share: share(tokens),
-        })
+        .map(|((agent, model), accrual)| accrual.into_summary(agent, model, total_tokens))
         .collect();
     top_models.sort_by_key(|model| Reverse(model.tokens));
     top_models.truncate(10);
@@ -914,7 +944,7 @@ fn query_snapshot_at(
         .iter()
         .map(|agent| (*agent, TokenComponents::default()))
         .collect();
-    let mut model_totals: HashMap<(String, String), i64> = HashMap::new();
+    let mut model_totals: HashMap<(String, String), ModelAccrual> = HashMap::new();
     let mut agent_cost: HashMap<&str, CostAccrual> = AGENT_IDS
         .iter()
         .map(|agent| (*agent, CostAccrual::default()))
@@ -949,7 +979,7 @@ fn query_snapshot_at(
             .filter(|value| !value.is_empty());
         // 模型分布里认不出名字的记成 "unknown"，计价一侧同样归入 unpriced。
         let model_map_key = ((*agent).to_owned(), model.unwrap_or("unknown").to_owned());
-        *model_totals.entry(model_map_key).or_insert(0) += event.tokens;
+        model_totals.entry(model_map_key).or_default().add(&event);
         agent_cost.get_mut(agent).expect("registered agent").add(
             model,
             event.timestamp,
@@ -1034,12 +1064,7 @@ fn query_snapshot_at(
 
     let mut models: Vec<ModelSummary> = model_totals
         .into_iter()
-        .map(|((agent, model), tokens)| ModelSummary {
-            model,
-            agent,
-            tokens,
-            share: share(tokens),
-        })
+        .map(|((agent, model), accrual)| accrual.into_summary(agent, model, total_tokens))
         .collect();
     models.sort_by_key(|model| Reverse(model.tokens));
 
@@ -1139,12 +1164,13 @@ fn load_events(connection: &Connection, start_ms: i64, end_ms: i64) -> Result<Ve
     // 的 "unknown" 区分开，而不是混在一起被误读成一个叫"未标注"的模型。
     let mut statement = connection.prepare(
         "SELECT adapter_id, occurred_at_ms, processed_tokens, model,
-                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens, request_input_tokens
+                input_uncached_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                request_input_tokens, response_duration_ms
          FROM usage_event
          WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
          UNION ALL
          SELECT adapter_id, occurred_at_ms, processed_tokens, 'synced-remote' AS model,
-                0, 0, 0, 0, NULL
+                0, 0, 0, 0, NULL, NULL
          FROM remote_usage_event
          WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
          ORDER BY occurred_at_ms",
@@ -1157,6 +1183,7 @@ fn load_events(connection: &Connection, start_ms: i64, end_ms: i64) -> Result<Ve
             model: row.get(3)?,
             comps: token_components(row, 4)?,
             request_input_tokens: row.get(8)?,
+            response_duration_ms: row.get(9)?,
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -1939,6 +1966,35 @@ mod tests {
                     output,
                     processed,
                 ],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_response_sample(
+        connection: &Connection,
+        event_id: &str,
+        adapter: &str,
+        model: &str,
+        timestamp: i64,
+        output: i64,
+        duration: Option<i64>,
+    ) {
+        // 输入远大于输出，确保速率分子不会误用 processed tokens。
+        insert_test_usage_full(
+            connection,
+            event_id,
+            adapter,
+            timestamp,
+            Some(model),
+            1000,
+            0,
+            0,
+            output,
+        );
+        connection
+            .execute(
+                "UPDATE usage_event SET response_duration_ms = ?1 WHERE event_id = ?2",
+                params![duration, event_id],
             )
             .unwrap();
     }
@@ -3043,6 +3099,207 @@ mod tests {
 
         let total_model_tokens: i64 = snapshot.models.iter().map(|entry| entry.tokens).sum();
         assert_eq!(total_model_tokens, snapshot.total_tokens);
+        assert!(snapshot.models.iter().all(|model| {
+            model.response_tokens_per_second.is_none() && model.response_sample_count == 0
+        }));
+    }
+
+    #[test]
+    fn response_speed_weights_paired_samples_and_keeps_agent_and_model_groups_separate() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
+        let local_now = test_local_time(today, 12);
+        let at = test_local_time(today, 10).timestamp_millis();
+        for (id, agent, model, output, duration) in [
+            ("fast", "zcode", "shared-model", 100, Some(1000)),
+            ("slow", "zcode", "shared-model", 100, Some(9000)),
+            ("untimed", "zcode", "shared-model", 9000, None),
+            ("zero-duration", "zcode", "shared-model", 20000, Some(0)),
+            (
+                "negative-duration",
+                "zcode",
+                "shared-model",
+                40000,
+                Some(-1),
+            ),
+            ("zero-output", "zcode", "shared-model", 0, Some(500000)),
+            ("other-agent", "claude", "shared-model", 7, Some(1000)),
+            ("other-model", "zcode", "other-model", 60, Some(2000)),
+            ("no-timing", "kimi", "untimed-model", 500, None),
+        ] {
+            insert_test_response_sample(&connection, id, agent, model, at, output, duration);
+        }
+
+        let snapshot =
+            query_snapshot_at(&connection, "today", ScanReport::default(), local_now).unwrap();
+        let selected = |agent: &str, model: &str| {
+            snapshot
+                .models
+                .iter()
+                .find(|summary| summary.agent == agent && summary.model == model)
+                .unwrap()
+        };
+        let shared = selected("zcode", "shared-model");
+        // 200 / 10 秒 = 20，不是两个请求速率 (100 + 100/9) 的算术平均。
+        assert_eq!(shared.response_tokens_per_second, Some(20.0));
+        assert_eq!(shared.response_sample_count, 2);
+        assert_eq!(shared.tokens, 100 + 100 + 9000 + 20000 + 40000 + 6 * 1000);
+        assert_eq!(
+            selected("claude", "shared-model").response_tokens_per_second,
+            Some(7.0)
+        );
+        assert_eq!(
+            selected("zcode", "other-model").response_tokens_per_second,
+            Some(30.0)
+        );
+        assert_eq!(
+            selected("kimi", "untimed-model").response_tokens_per_second,
+            None
+        );
+        assert_eq!(selected("kimi", "untimed-model").response_sample_count, 0);
+
+        let report = report_at(&connection, local_now).unwrap();
+        for model in &snapshot.models {
+            let historical = report
+                .top_models
+                .iter()
+                .find(|summary| summary.agent == model.agent && summary.model == model.model)
+                .unwrap();
+            assert_eq!(
+                historical.response_tokens_per_second,
+                model.response_tokens_per_second
+            );
+            assert_eq!(
+                historical.response_sample_count,
+                model.response_sample_count
+            );
+        }
+    }
+
+    #[test]
+    fn response_speed_respects_periods_and_remote_events_never_gain_timing() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
+        let local_now = test_local_time(today, 12);
+        let at = test_local_time(today, 10).timestamp_millis();
+        for (id, time, output, duration) in [
+            ("today", at, 100, 5000),
+            (
+                "yesterday",
+                test_local_time(today - Duration::days(1), 10).timestamp_millis(),
+                100,
+                1000,
+            ),
+            (
+                "old",
+                test_local_time(today - Duration::days(REPORT_WINDOW_DAYS), 10).timestamp_millis(),
+                10000,
+                1,
+            ),
+            (
+                "future",
+                test_local_time(today, 13).timestamp_millis(),
+                10000,
+                1,
+            ),
+        ] {
+            insert_test_response_sample(
+                &connection,
+                id,
+                "zcode",
+                "model-a",
+                time,
+                output,
+                Some(duration),
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO remote_usage_event (device_id, event_id, adapter_id, occurred_at_ms,
+                     processed_tokens) VALUES ('remote-device', 'remote-response', 'zcode', ?1, 1000000)",
+                [at],
+            )
+            .unwrap();
+        let loaded = load_events(&connection, at, at + 1).unwrap();
+        let remote = loaded
+            .iter()
+            .find(|event| event.model.as_deref() == Some("synced-remote"))
+            .unwrap();
+        assert!(remote.response_duration_ms.is_none());
+        assert_eq!(remote.comps.output, 0);
+
+        let today_snapshot =
+            query_snapshot_at(&connection, "today", ScanReport::default(), local_now).unwrap();
+        let week_snapshot =
+            query_snapshot_at(&connection, "week", ScanReport::default(), local_now).unwrap();
+        let report = report_at(&connection, local_now).unwrap();
+        let today_model = today_snapshot
+            .models
+            .iter()
+            .find(|model| model.model == "model-a")
+            .unwrap();
+        assert_eq!(today_model.response_tokens_per_second, Some(20.0));
+        assert_eq!(today_model.response_sample_count, 1);
+        let week_model = week_snapshot
+            .models
+            .iter()
+            .find(|model| model.model == "model-a")
+            .unwrap();
+        assert!((week_model.response_tokens_per_second.unwrap() - 200000.0 / 6000.0).abs() < 1e-10);
+        assert_eq!(week_model.response_sample_count, 2);
+        let historical = report
+            .top_models
+            .iter()
+            .find(|model| model.model == "model-a")
+            .unwrap();
+        assert_eq!(
+            historical.response_tokens_per_second,
+            week_model.response_tokens_per_second
+        );
+        assert_eq!(historical.response_sample_count, 2);
+        for models in [
+            &today_snapshot.models,
+            &week_snapshot.models,
+            &report.top_models,
+        ] {
+            let remote = models
+                .iter()
+                .find(|model| model.model == "synced-remote")
+                .unwrap();
+            assert!(remote.response_tokens_per_second.is_none());
+            assert_eq!(remote.response_sample_count, 0);
+        }
+    }
+
+    #[test]
+    fn response_speed_sums_durations_beyond_the_integer_range_without_overflow() {
+        let mut accrual = ModelAccrual::default();
+        let event = StoredEvent {
+            adapter: "zcode".into(),
+            timestamp: 0,
+            tokens: 10,
+            model: Some("model".into()),
+            comps: TokenComponents {
+                output: 10,
+                ..Default::default()
+            },
+            request_input_tokens: None,
+            response_duration_ms: Some(i64::MAX),
+        };
+        accrual.add(&event);
+        accrual.add(&event);
+        let summary = accrual.into_summary("zcode".into(), "model".into(), 20);
+        assert_eq!(summary.response_sample_count, 2);
+        assert_eq!(
+            summary.response_tokens_per_second,
+            Some(20000.0 / (2.0 * i64::MAX as f64))
+        );
     }
 
     #[test]

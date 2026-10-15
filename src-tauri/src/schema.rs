@@ -130,6 +130,7 @@ fn ensure_optional_columns(connection: &Connection) -> Result<()> {
     for (table, column, definition) in [
         ("usage_event", "project_path", "TEXT"),
         ("usage_event", "request_input_tokens", "INTEGER"),
+        ("usage_event", "response_duration_ms", "INTEGER"),
     ] {
         if !table_has_column(connection, table, column)? {
             connection
@@ -297,6 +298,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE usage_event DROP COLUMN project_path;
                  ALTER TABLE usage_event DROP COLUMN request_input_tokens;
+                 ALTER TABLE usage_event DROP COLUMN response_duration_ms;
                  INSERT INTO usage_event VALUES (
                      'keep', 'codex', 'key', 1, 'session', 'gpt-5.2',
                      1, 0, 0, 1, 0, 2, 'exact', 'hash'
@@ -308,6 +310,7 @@ mod tests {
         ensure_schema(&connection).unwrap();
 
         assert!(table_has_column(&connection, "usage_event", "project_path").unwrap());
+        assert!(table_has_column(&connection, "usage_event", "response_duration_ms").unwrap());
         let kept: Option<String> = connection
             .query_row(
                 "SELECT project_path FROM usage_event WHERE event_id = 'keep'",
@@ -316,6 +319,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, None);
+        let timed: (i64, Option<i64>) = connection.query_row(
+            "SELECT processed_tokens, response_duration_ms FROM usage_event WHERE event_id = 'keep'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(timed, (2, None), "adding timing must retain existing usage");
     }
 
     #[test]

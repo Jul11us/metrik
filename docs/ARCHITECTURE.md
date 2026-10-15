@@ -115,6 +115,29 @@ Claude Code can repeat and progressively update the same assistant message. The 
 
 Kimi legacy StatusUpdates carry no scope marker and it is not documented whether they progressively update. The adapter merges them by `message_id` taking component-wise maxima, which is correct either way: true deltas appear once per id, and progressive updates collapse to the final value instead of summing.
 
+## Historical response speed
+
+`usage_event.response_duration_ms` is optional enrichment and stays outside the
+event identity and `payload_hash`. Zcode reads `started_at` / `completed_at`
+only for rows explicitly marked `status = 'completed'`; absent status columns,
+missing endpoints, nonpositive or reversed timestamps retain token usage but
+produce no timing. Real local rows confirmed millisecond timestamps and
+positive per-request intervals; end timestamps alone also occur on unsuccessful
+requests, so they do not establish completion. Zcode parser revision 8 rescans
+retained sources to enrich old events without changing counts or identities.
+Other adapters do not guess timing from session duration or adjacent events.
+
+Model summaries share one aggregation for snapshots and history reports:
+`sum(timed output tokens) * 1000 / sum(response_duration_ms)`, grouped by Agent
+and model in the requested period. Only positive output paired with positive
+duration contributes, and `response_sample_count` reports that subset. This
+duration-weighted response average includes waiting, prefill and reasoning; it
+is neither pure generation speed nor live throughput. Imported sync events
+carry no timing and cannot dilute or inflate the measured rate. Timing stays
+local; the existing sync format is unchanged. Schema upgrades add a nullable
+column in place, preserving old usage. Same-payload rescans enrich timing;
+counter merges never pair an older duration with newly increased output.
+
 ## Quota
 
 Quota rows are replaced wholesale, never merged, so a window a plan no longer has cannot linger as a stale row:
@@ -209,7 +232,7 @@ missing or unreadable ledger is a stderr message with a non-zero exit code.
   the table is wholesale-replaced derived data, so only one stale quota round
   is lost.
 
-SQLite runs in WAL mode under the operating system's local application-data directory. Source replacement and observation updates are transactional. The shared `PARSER_VERSION` is currently 7, with Codex using parser version 8 while request-level pricing metadata is enriched, Pi using 8 so Kimi Code and ChatGPT subscription usage moves to its own cards, and Antigravity using 10: 9 reconciled decoder diagnostics and output-split validation, and 10 rescans conversations parsed before project attribution so their history is backfilled. Version changes force retained-history reconciliation.
+SQLite runs in WAL mode under the operating system's local application-data directory. Source replacement and observation updates are transactional. The shared `PARSER_VERSION` is currently 7, with Codex using parser version 8 while request-level pricing metadata is enriched, Pi using 8 so Kimi Code and ChatGPT subscription usage moves to its own cards, Zcode using 8 to backfill completed-response timing, and Antigravity using 10: 9 reconciled decoder diagnostics and output-split validation, and 10 rescans conversations parsed before project attribution so their history is backfilled. Version changes force retained-history reconciliation.
 
 `usage_event.project_path` records the working directory an event happened in, so usage can be grouped by project as well as by session. Optional columns like it are added with `ALTER TABLE` and stay out of the required-column check: listing one there would classify every existing ledger as incompatible and rebuild it, when the column simply reads NULL until the next scan. The path is deliberately **not** part of `payload_hash` — it is attribution, not a measured quantity, and hashing it would make the same event hash differently after a parser upgrade, which non-mergeable adapters reject as an identity collision. Backfill is therefore its own write: a rescan fills the column when it is NULL and never overwrites a value already there, because where usage happened is settled fact.
 

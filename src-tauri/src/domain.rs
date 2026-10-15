@@ -137,6 +137,10 @@ pub struct UsageEvent {
     pub project_path: Option<String>,
     /// Validated single-request input size; never a session or period total.
     pub request_input_tokens: Option<i64>,
+    /// Elapsed milliseconds for this completed response, including waiting,
+    /// prefill, reasoning and any tools inside the recorded response interval.
+    /// Optional enrichment, not part of token identity or payload_hash.
+    pub response_duration_ms: Option<i64>,
 }
 
 impl UsageEvent {
@@ -172,12 +176,25 @@ impl UsageEvent {
             payload_hash,
             project_path: None,
             request_input_tokens: None,
+            response_duration_ms: None,
         }
     }
 
     /// 附加项目归属；`None` 与空白路径都保持"未归属"。
     pub fn with_project(mut self, project_path: Option<String>) -> Self {
         self.project_path = project_path.and_then(|value| normalize_project_path(&value));
+        self
+    }
+
+    /// Only use an explicitly recorded start and completion for the same
+    /// response. A session span or gap between messages is never a substitute.
+    pub fn with_response_timing(mut self, start_ms: Option<i64>, end_ms: Option<i64>) -> Self {
+        self.response_duration_ms = start_ms.zip(end_ms).and_then(|(start, end)| {
+            if start <= 0 {
+                return None;
+            }
+            end.checked_sub(start).filter(|duration| *duration > 0)
+        });
         self
     }
 }
@@ -376,6 +393,10 @@ pub struct ModelSummary {
     pub agent: String,
     pub tokens: i64,
     pub share: f64,
+    /// Sum of output tokens divided by summed response time for timed samples
+    /// only; includes waiting and is not a pure generation-speed measurement.
+    pub response_tokens_per_second: Option<f64>,
+    pub response_sample_count: i64,
 }
 
 /// 只读的历史报告：182 天窗口内每日、按 Agent、按模型的 processed token 聚合，
@@ -549,6 +570,46 @@ pub fn stable_hash(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{TokenVector, UsageEvent};
+
+    #[test]
+    fn response_timing_requires_recorded_positive_bounds_and_preserves_identity() {
+        let event = UsageEvent::new(
+            "zcode",
+            "request:one".into(),
+            3_000,
+            "session".into(),
+            Some("model".into()),
+            TokenVector {
+                output: 20,
+                ..Default::default()
+            },
+            "exact",
+        );
+        let timed = event.clone().with_response_timing(Some(1_000), Some(3_000));
+        assert_eq!(timed.response_duration_ms, Some(2_000));
+        assert_eq!(event.event_id, timed.event_id);
+        assert_eq!(event.payload_hash, timed.payload_hash);
+        assert_eq!(event.tokens, timed.tokens);
+        for (start, end) in [
+            (None, Some(3_000)),
+            (Some(1_000), None),
+            (Some(0), Some(3_000)),
+            (Some(-1), Some(3_000)),
+            (Some(3_000), Some(3_000)),
+            (Some(3_000), Some(2_000)),
+            (Some(i64::MAX), Some(i64::MIN)),
+        ] {
+            assert_eq!(
+                event
+                    .clone()
+                    .with_response_timing(start, end)
+                    .response_duration_ms,
+                None
+            );
+        }
+    }
+
     /// 事件与来源身份都落盘，哈希的文本形态（小写十六进制）不能变。
     #[test]
     fn stable_hash_is_lowercase_hex_sha256() {
