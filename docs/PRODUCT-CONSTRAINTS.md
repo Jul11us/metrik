@@ -350,6 +350,17 @@ change.
 
 ## Window state and statistics
 
+- Historical model speed is a response average: output tokens from completed,
+  timed requests divided by their summed recorded response time. It includes
+  waiting, prefill and reasoning (and tools within a source's recorded interval),
+  not pure decoding speed or a live stream measurement. Show its timed sample
+  count; unmeasured events never enter its numerator or denominator. Missing
+  timing stays unavailable, never zero or an estimate from session spans.
+  Speed is grouped by Agent and model within the selected period. It is a
+  measurement of that usage source, not a benchmark of a model across providers.
+  Initially only Zcode's explicitly completed requests have verified timing;
+  other sources require their own timing validation before reporting speed.
+
 - Pinning belongs only to floating forms. Expanded mode is always a normal
   window.
 - On Windows, compact, strip, and expanded positions are remembered separately.

@@ -2766,7 +2766,8 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
   grid-template-columns: 8px minmax(0, 1fr) auto;
   grid-template-areas:
     "dot name value"
-    ". track track";
+    ". track track"
+    ". speed speed";
   column-gap: 9px;
   row-gap: 5px;
 }
@@ -2775,6 +2776,76 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
 .breakdown-card .model-list li > .model-name { grid-area: name; }
 .breakdown-card .model-list li > .model-track { grid-area: track; }
 .breakdown-card .model-list li > em { grid-area: value; }
+
+.model-list--response-speed li {
+  grid-template-areas:
+    "dot name track value"
+    ". speed speed speed";
+  row-gap: 5px;
+}
+
+.model-list--response-speed li > .model-dot { grid-area: dot; }
+.model-list--response-speed li > .model-name { grid-area: name; }
+.model-list--response-speed li > .model-track { grid-area: track; }
+.model-list--response-speed li > em { grid-area: value; }
+
+.model-speed-help {
+  position: relative;
+  width: fit-content;
+  margin-top: -6px;
+}
+
+.model-speed-help-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+  color: #74767a;
+  font-size: 11px;
+  background: transparent;
+  border: 0;
+  cursor: help;
+}
+
+.model-speed-tooltip {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  z-index: 4;
+  width: 300px;
+  max-width: calc(100vw - 48px);
+  padding: 11px 13px;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.55;
+  background: rgba(29, 31, 34, 0.96);
+  border-radius: 9px;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.model-speed-help:not([data-dismissed="true"]):hover .model-speed-tooltip,
+.model-speed-help:not([data-dismissed="true"]):focus-within .model-speed-tooltip {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.model-response-speed {
+  grid-area: speed;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 3px 10px;
+  color: #66696e;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.model-response-speed strong { font-weight: 520; }
+.model-response-speed strong > span { font-size: 10px; font-weight: 400; }
+.model-response-speed small { color: #85878b; font-size: 10px; }
+.model-response-speed--unavailable { color: #85878b; }
 
 .model-dot {
   width: 8px;
@@ -4982,6 +5053,11 @@ html:has(.strip-shell--detail-open.strip-shell--glass-clear) #root::after {
 :root[data-theme="dark"] .comp-legend em,
 :root[data-theme="dark"] .model-list em { color: var(--d-muted); }
 :root[data-theme="dark"] .model-name { color: var(--d-ink-3); }
+:root[data-theme="dark"] .model-speed-help-button,
+:root[data-theme="dark"] .model-response-speed { color: var(--d-muted); }
+:root[data-theme="dark"] .model-response-speed small,
+:root[data-theme="dark"] .model-response-speed--unavailable { color: var(--d-faint); }
+:root[data-theme="dark"] .model-speed-tooltip { background: rgba(70, 72, 80, 0.98); }
 :root[data-theme="dark"] .model-track { background: var(--d-sunken); }
 :root[data-theme="dark"] .cost-total strong { color: var(--d-strong); }
 :root[data-theme="dark"] .cost-total span { color: var(--d-muted); }

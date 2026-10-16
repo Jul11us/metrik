@@ -42,18 +42,30 @@ impl AgentAdapter for ZcodeAdapter {
         .with_context(|| format!("failed to open {}", candidate.path.display()))?;
         connection.pragma_update(None, "busy_timeout", 2_000_i64)?;
         let session_directories = super::opencode_session_directories(&connection);
+        // status 是计时的可选证据；旧库缺这一列时仍读取原有 token，计时留空。
+        let has_status = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('model_usage') WHERE name = 'status')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let completed = if has_status {
+            "CASE WHEN status = 'completed' THEN 1 ELSE 0 END"
+        } else {
+            "0"
+        };
 
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&format!(
             "SELECT id, session_id, model_id,
                     COALESCE(completed_at, started_at),
                     COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
                     COALESCE(reasoning_tokens, 0),
                     COALESCE(cache_creation_input_tokens, 0),
-                    COALESCE(cache_read_input_tokens, 0)
+                    COALESCE(cache_read_input_tokens, 0),
+                    started_at, completed_at, {completed}
              FROM model_usage
              WHERE COALESCE(completed_at, started_at) >= ?1
              ORDER BY COALESCE(completed_at, started_at)",
-        )?;
+        ))?;
         let rows = statement.query_map([cutoff_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -65,6 +77,10 @@ impl AgentAdapter for ZcodeAdapter {
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
+                // 可选计时字段损坏时不能丢掉仍可计量的 token。
+                row.get::<_, Option<i64>>(9).ok().flatten(),
+                row.get::<_, Option<i64>>(10).ok().flatten(),
+                row.get::<_, bool>(11)?,
             ))
         })?;
 
@@ -81,6 +97,9 @@ impl AgentAdapter for ZcodeAdapter {
                 reasoning,
                 cache_write,
                 cache_read,
+                started_at,
+                completed_at,
+                completed,
             )) = row
             else {
                 diagnostics.malformed_lines += 1;
@@ -99,6 +118,8 @@ impl AgentAdapter for ZcodeAdapter {
                 continue;
             }
             let project = session_directories.get(&session_id).cloned();
+            // 这是完成响应的墙钟耗时，包含等待等开销，不是首末 token 的纯生成时长。
+            let response_start = started_at.filter(|_| completed && tokens.output > 0);
             events.push(
                 UsageEvent::new(
                     "zcode",
@@ -109,7 +130,8 @@ impl AgentAdapter for ZcodeAdapter {
                     tokens,
                     "exact",
                 )
-                .with_project(project),
+                .with_project(project)
+                .with_response_timing(response_start, completed_at),
             );
         }
 
@@ -212,11 +234,197 @@ mod tests {
         assert_eq!(first.tokens.input_uncached, 15265 - 14656);
         assert_eq!(first.tokens.cache_read, 14656);
         assert_eq!(first.tokens.processed(), 15265 + 247);
+        assert_eq!(first.response_duration_ms, Some(5_459));
         // 被取消但已产生用量的请求按实际消耗入账，用 started_at 兜底。
         let second = &scan.source.events[1];
         assert_eq!(second.occurred_at_ms, 1_783_242_620_000);
         assert_eq!(second.tokens.processed(), 105);
+        assert_eq!(second.response_duration_ms, None);
         assert!(!scan.diagnostics.is_partial());
+    }
+
+    #[test]
+    fn response_timing_requires_a_completed_request_and_valid_positive_bounds() {
+        let test = TestDirectory::new("response-timing");
+        let db_path = test.path().join("db.sqlite");
+        let fixture = create_fixture_db(&db_path);
+        let cases = [
+            (
+                "valid",
+                Some("completed"),
+                Some(1_000),
+                Some(4_500),
+                50,
+                Some(3_500),
+            ),
+            (
+                "missing-start",
+                Some("completed"),
+                None,
+                Some(4_500),
+                50,
+                None,
+            ),
+            (
+                "missing-end",
+                Some("completed"),
+                Some(1_000),
+                None,
+                50,
+                None,
+            ),
+            (
+                "zero-start",
+                Some("completed"),
+                Some(0),
+                Some(4_500),
+                50,
+                None,
+            ),
+            (
+                "negative-start",
+                Some("completed"),
+                Some(-1),
+                Some(4_500),
+                50,
+                None,
+            ),
+            (
+                "equal",
+                Some("completed"),
+                Some(1_000),
+                Some(1_000),
+                50,
+                None,
+            ),
+            (
+                "reversed",
+                Some("completed"),
+                Some(4_500),
+                Some(1_000),
+                50,
+                None,
+            ),
+            (
+                "overflow",
+                Some("completed"),
+                Some(i64::MIN),
+                Some(i64::MAX),
+                50,
+                None,
+            ),
+            (
+                "cancelled",
+                Some("cancelled"),
+                Some(1_000),
+                Some(4_500),
+                50,
+                None,
+            ),
+            ("error", Some("error"), Some(1_000), Some(4_500), 50, None),
+            ("unknown-status", None, Some(1_000), Some(4_500), 50, None),
+            (
+                "zero-output",
+                Some("completed"),
+                Some(1_000),
+                Some(4_500),
+                0,
+                None,
+            ),
+        ];
+        for (id, status, started_at, completed_at, output, _) in &cases {
+            fixture
+                .execute(
+                    "INSERT INTO model_usage
+                     (id, session_id, model_id, status, started_at, completed_at,
+                      input_tokens, output_tokens, reasoning_tokens,
+                      cache_creation_input_tokens, cache_read_input_tokens)
+                     VALUES (?1, 'sess-a', 'GLM-5.2', ?2, ?3, ?4, 100, ?5, 7, 0, 10)",
+                    rusqlite::params![id, status, started_at, completed_at, output],
+                )
+                .unwrap();
+        }
+        // completed_at 仍可用于原有事件归日；新增的可选开始时间坏了不应丢 token。
+        fixture
+            .execute_batch(
+                "INSERT INTO model_usage
+                 (id, session_id, model_id, status, started_at, completed_at,
+                  input_tokens, output_tokens, reasoning_tokens,
+                  cache_creation_input_tokens, cache_read_input_tokens)
+                 VALUES ('bad-start-type', 'sess-a', 'GLM-5.2', 'completed',
+                         'not-a-timestamp', 4500, 100, 50, 7, 0, 10);",
+            )
+            .unwrap();
+        drop(fixture);
+        let adapter = ZcodeAdapter::with_database(db_path);
+        let scan = adapter.parse(&adapter.discover(0)[0], 0).unwrap();
+        assert!(!scan.diagnostics.is_partial());
+        assert_eq!(scan.source.events.len(), cases.len() + 1);
+        for (id, _, started_at, completed_at, output, duration) in cases {
+            let event_key = format!("request:{id}");
+            let event = scan
+                .source
+                .events
+                .iter()
+                .find(|event| event.event_key == event_key)
+                .unwrap();
+            let previous_event = UsageEvent::new(
+                "zcode",
+                event_key,
+                completed_at.or(started_at).unwrap(),
+                "sess-a".into(),
+                Some("GLM-5.2".into()),
+                TokenVector {
+                    input_uncached: 90,
+                    cache_read: 10,
+                    cache_write: 0,
+                    output,
+                    reasoning_output: 7,
+                },
+                "exact",
+            );
+            assert_eq!(event.response_duration_ms, duration, "{id}");
+            assert_eq!(event.tokens.processed(), 100 + output, "{id}");
+            assert_eq!(event.tokens.output, output, "{id}");
+            assert_eq!(event.event_id, previous_event.event_id, "{id}");
+            assert_eq!(event.payload_hash, previous_event.payload_hash, "{id}");
+        }
+        let bad_start = scan
+            .source
+            .events
+            .iter()
+            .find(|event| event.event_key == "request:bad-start-type")
+            .unwrap();
+        assert_eq!(bad_start.response_duration_ms, None);
+        assert_eq!(bad_start.tokens.processed(), 150);
+    }
+
+    #[test]
+    fn a_legacy_database_without_status_keeps_usage_and_leaves_timing_unknown() {
+        let test = TestDirectory::new("legacy-timing");
+        let db_path = test.path().join("db.sqlite");
+        let fixture = create_fixture_db(&db_path);
+        fixture
+            .execute_batch(
+                "ALTER TABLE model_usage DROP COLUMN status;
+                 INSERT INTO model_usage
+                 (id, session_id, model_id, started_at, completed_at,
+                  input_tokens, output_tokens, reasoning_tokens,
+                  cache_creation_input_tokens, cache_read_input_tokens)
+                 VALUES ('legacy', 'sess-a', 'GLM-5.2', 1000, 4500, 100, 50, 7, 0, 10);",
+            )
+            .unwrap();
+        drop(fixture);
+        let adapter = ZcodeAdapter::with_database(db_path);
+        let scan = adapter.parse(&adapter.discover(0)[0], 0).unwrap();
+        assert!(!scan.diagnostics.is_partial());
+        assert_eq!(scan.source.events.len(), 1);
+        let event = &scan.source.events[0];
+        assert_eq!(event.event_key, "request:legacy");
+        assert_eq!(event.occurred_at_ms, 4_500);
+        assert_eq!(event.tokens.processed(), 150);
+        assert_eq!(event.tokens.output, 50);
+        assert_eq!(event.response_duration_ms, None);
     }
 
     #[test]

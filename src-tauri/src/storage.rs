@@ -23,9 +23,10 @@ pub const PARSER_VERSION: i64 = 7;
 /// Pi 8 重扫 pi 来源，让 kimi-coding / openai-codex 路由的用量改记到 Kimi / Codex 卡片。
 /// Antigravity 9 重扫旧来源，让嵌套解码失败与零响应输出的口径异常正确标为不完整；
 /// 10 再重扫一次本地会话库，给已入账的历史用量回填项目归属（只填空值）。
+/// Zcode 8 enriches completed responses with their recorded elapsed time.
 pub fn parser_version_for(adapter: &str) -> i64 {
     match adapter {
-        "codex" | "pi" => 8,
+        "codex" | "pi" | "zcode" => 8,
         "antigravity" => 10,
         _ => PARSER_VERSION,
     }
@@ -337,8 +338,8 @@ fn insert_or_merge_usage_event(
                 event_id, adapter_id, event_key, occurred_at_ms, session_id, model,
                 input_uncached_tokens, cache_read_tokens, cache_write_tokens,
                 output_tokens, reasoning_tokens, processed_tokens, quality, payload_hash,
-                project_path, request_input_tokens
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                project_path, request_input_tokens, response_duration_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 event.event_id,
                 event.adapter_id,
@@ -356,6 +357,7 @@ fn insert_or_merge_usage_event(
                 event.payload_hash,
                 event.project_path,
                 event.request_input_tokens,
+                event.response_duration_ms.filter(|duration| *duration > 0),
             ],
         )?;
         return Ok(EventWriteOutcome::Accepted);
@@ -427,8 +429,13 @@ fn insert_or_merge_usage_event(
     }
     if stored.payload_hash == event.payload_hash && !fills_missing_model {
         transaction.execute(
-            "UPDATE usage_event SET request_input_tokens = COALESCE(?2, request_input_tokens) WHERE event_id = ?1",
-            params![event.event_id, event.request_input_tokens],
+            "UPDATE usage_event SET request_input_tokens = COALESCE(?2, request_input_tokens),
+                 response_duration_ms = COALESCE(?3, response_duration_ms) WHERE event_id = ?1",
+            params![
+                event.event_id,
+                event.request_input_tokens,
+                event.response_duration_ms.filter(|duration| *duration > 0)
+            ],
         )?;
         return Ok(EventWriteOutcome::Accepted);
     }
@@ -470,7 +477,8 @@ fn insert_or_merge_usage_event(
             reasoning_tokens = ?9,
             processed_tokens = ?10,
             quality = ?11,
-            payload_hash = ?12
+            payload_hash = ?12,
+            response_duration_ms = ?13
          WHERE event_id = ?1",
         params![
             merged.event_id,
@@ -485,6 +493,10 @@ fn insert_or_merge_usage_event(
             merged.tokens.processed(),
             merged.quality,
             merged.payload_hash,
+            // Never pair an earlier sample's duration with merged counters.
+            event
+                .response_duration_ms
+                .filter(|duration| { *duration > 0 && merged.tokens == event.tokens }),
         ],
     )?;
     Ok(EventWriteOutcome::Accepted)
@@ -617,6 +629,113 @@ mod tests {
             events,
             quotas: vec![],
         }
+    }
+
+    #[test]
+    fn response_timing_backfills_without_changing_usage_and_is_stable_on_replay() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::schema::ensure_schema(&connection).unwrap();
+        let event = UsageEvent::new(
+            "zcode",
+            "request:timed".into(),
+            3_000,
+            "session".into(),
+            Some("glm".into()),
+            TokenVector {
+                output: 40,
+                ..Default::default()
+            },
+            "exact",
+        );
+        let stored = |connection: &Connection| -> (i64, i64, String, Option<i64>) {
+            connection.query_row(
+                "SELECT COUNT(*), SUM(processed_tokens), MIN(payload_hash), MIN(response_duration_ms) FROM usage_event",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap()
+        };
+        replace_source(
+            &mut connection,
+            &source("timed-source", "zcode", vec![event.clone()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            stored(&connection),
+            (1, 40, event.payload_hash.clone(), None)
+        );
+        let timed = event.clone().with_response_timing(Some(1_000), Some(3_000));
+        for candidate in [timed.clone(), timed, event.clone()] {
+            replace_source(
+                &mut connection,
+                &source("timed-source", "zcode", vec![candidate]),
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                stored(&connection),
+                (1, 40, event.payload_hash.clone(), Some(2_000))
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_counter_updates_do_not_reuse_an_earlier_duration() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::schema::ensure_schema(&connection).unwrap();
+        let event = |output| {
+            UsageEvent::new(
+                "claude",
+                "message:progressive".into(),
+                3_000,
+                "session".into(),
+                Some("model".into()),
+                TokenVector {
+                    output,
+                    ..Default::default()
+                },
+                "exact",
+            )
+        };
+        replace_source(
+            &mut connection,
+            &source(
+                "progressive",
+                "claude",
+                vec![event(20).with_response_timing(Some(1_000), Some(3_000))],
+            ),
+            0,
+        )
+        .unwrap();
+        replace_source(
+            &mut connection,
+            &source("progressive", "claude", vec![event(40)]),
+            0,
+        )
+        .unwrap();
+        let result: (i64, Option<i64>) = connection
+            .query_row(
+                "SELECT output_tokens, response_duration_ms FROM usage_event",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, (40, None));
+    }
+
+    #[test]
+    fn old_zcode_sources_reparse_to_backfill_response_timing() {
+        let connection = Connection::open_in_memory().unwrap();
+        crate::schema::ensure_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO scan_source (source_id, adapter_id, logical_key, locator,
+                observed_size, mtime_ns, coverage_start_ms, parser_version, last_success_ms)
+             VALUES ('zcode-old', 'zcode', 'zcode-old', 'usage.db', 10, 1, 0, ?1, 0)",
+                [PARSER_VERSION],
+            )
+            .unwrap();
+        assert!(!source_is_current(&connection, "zcode-old", 10, 1, 0).unwrap());
+        assert_eq!(parser_version_for("opencode"), PARSER_VERSION);
     }
 
     #[test]
